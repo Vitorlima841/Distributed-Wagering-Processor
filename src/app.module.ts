@@ -1,7 +1,9 @@
 import { type DynamicModule, Module } from '@nestjs/common';
 import { APP_CONFIG, type AppConfig, type Role } from './infrastructure/config/app-config';
 import { DatabaseModule } from './infrastructure/database/database.module';
-import { HttpModule } from './interfaces/http/http.module';
+import { InfrastructureModule } from './infrastructure/infrastructure.module';
+import { ApiModule, HttpModule } from './interfaces/http/http.module';
+import { UseCasesModule } from './interfaces/use-cases.module';
 import {
   ConsumerModule,
   OutboxModule,
@@ -9,7 +11,7 @@ import {
 } from './interfaces/workers/workers.module';
 
 const MODULES_BY_ROLE: Record<Exclude<Role, 'all'>, unknown[]> = {
-  api: [],
+  api: [ApiModule],
   consumer: [ConsumerModule],
   outbox: [OutboxModule],
   'pending-ref': [PendingRefModule],
@@ -25,7 +27,13 @@ export class AppModule {
     return {
       module: AppModule,
       global: true,
-      imports: [DatabaseModule, HttpModule, ...(roleModules as DynamicModule[])],
+      imports: [
+        DatabaseModule,
+        InfrastructureModule,
+        UseCasesModule,
+        HttpModule,
+        ...(roleModules as DynamicModule[]),
+      ],
       providers: [{ provide: APP_CONFIG, useValue: config }],
       exports: [APP_CONFIG],
     };

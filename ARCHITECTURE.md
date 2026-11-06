@@ -76,13 +76,19 @@ os workers.
   money{amount,currency}, referenceExternalTransactionId`. O amount entra já normalizado. Header e
   metadados de transporte ficam de fora.
 - No banco: `UNIQUE (idempotency_key)` e `UNIQUE (provider_id, external_transaction_id)`.
-- Fluxo: depois do lock da wallet, busca pela key:
-  - não existe → processa;
-  - existe com o mesmo hash → **replay**: devolve o snapshot salvo (`status`, `balance_after`) com
-    `idempotentReplay: true`;
-  - existe com hash diferente → **conflito** (409), não é replay.
-- Corrida residual (duas requisições sem wallet válida, por exemplo): a constraint única barra a segunda,
-  que faz rollback, relê e responde replay ou conflito.
+- Fluxo (`ProcessWagerTransaction`, detalhes na seção 16):
+  1. busca pela key **sem lock**: se existe, responde replay ou conflito sem travar a wallet (estado
+     terminal não muda e o snapshot fica fixo);
+  2. `FOR UPDATE` na wallet;
+  3. busca pela key de novo, já serializado pela wallet (quem esperou o lock acha o que o dono do
+     lock confirmou);
+  4. key nova, mas `(providerId, externalTransactionId)` já usado com outra key → **409
+     `EXTERNAL_TRANSACTION_CONFLICT`**, mesmo com payload igual (o header é a fonte da verdade).
+  - Mesmo hash → **replay**: devolve o snapshot salvo (`status`, `balance_after`) com
+    `idempotentReplay: true`. Hash diferente → **409 `IDEMPOTENCY_CONFLICT`**, não é replay.
+- Corrida residual (mesma key em wallets diferentes, que não disputam o mesmo lock): a constraint
+  única barra a segunda no flush, que faz rollback e roda o fluxo de novo **uma vez**; os passos 1 e
+  3 então respondem replay ou conflito.
 - Inbox do SQS: PK `(consumer_name, message_id)` na mesma transação.
 
 ## 6. Schema
@@ -112,12 +118,14 @@ Garantias aplicadas no banco (restrição 9), cada uma coberta em `test/integrat
 | Saldo ↔ ledger ↔ transação consistentes no COMMIT | `ux_ledger_wallet_version`, `tg_ledger_consistency`, `tg_wallet_matches_ledger`, `tg_wager_tx_has_entry` (seção 15) |
 
 Índices de acesso: `ix_wager_tx_pending_reference_due` (worker), `ix_outbox_due` (publisher) e
-`ux_ledger_wallet_seq` (cursor do ledger por wallet; estável porque o lock da wallet serializa os inserts).
+`ux_ledger_wallet_version` (cursor do ledger por wallet: `wallet_version` é contígua e só cresce,
+porque o lock da wallet serializa os lançamentos). `ux_ledger_wallet_seq` fica como ordem global de
+inserção.
 
 A transação `OPENING` usa `provider_id = 'internal'` e `idempotency_key = 'opening:{walletId}'`.
 A API e a fila rejeitam `kind = OPENING`.
 
-## 7. Regras de negócio e códigos de falha (rascunho)
+## 7. Regras de negócio e códigos de falha
 
 | `failureCode` | Quando | Provedor deve |
 |---|---|---|
@@ -137,19 +145,24 @@ Transições do `WagerTransaction`:
 `PENDING → PROCESSED | REJECTED | FAILED | PENDING_REFERENCE` e
 `PENDING_REFERENCE → PROCESSED | REJECTED | FAILED`. Estados terminais não mudam.
 
-## 8. Mapeamento HTTP (rascunho)
+## 8. Mapeamento HTTP
 
-| Situação | Status |
-|---|---|
-| Processada | `201` (replay: `200` com `idempotentReplay: true`) |
-| Aceita, aguardando referência (`PENDING_REFERENCE`) | `202` |
-| Payload inválido / header ausente | `400` |
-| Recurso não encontrado (wallet, transação) | `404` |
-| Conflito de idempotência / wallet duplicada | `409` |
-| Rejeitada por regra de negócio (corpo traz `failureCode`) | `422` |
-| Falha transitória (Postgres/SQS fora, timeout de lock) | `503` com `Retry-After` |
+| Situação | Status | `error.code` / corpo |
+|---|---|---|
+| Processada | `201` (replay: `200` com `idempotentReplay: true`) | `{ transactionId, status, balance, idempotentReplay }` |
+| Aceita, aguardando referência (`PENDING_REFERENCE`) | `202` (replay também `202`) | idem |
+| Rejeitada por regra de negócio (persistida como REJECTED) | `422` (replay também `422`) | idem + `failureCode`, `providerAction` |
+| Payload inválido / header ausente / cursor ou limit inválido | `400` | `INVALID_REQUEST` (com `details`), `INVALID_MONEY`, `INVALID_FIELD`, `MISSING_IDEMPOTENCY_KEY`, `INVALID_CURSOR`… |
+| Recurso não encontrado | `404` | `WALLET_NOT_FOUND`, `TRANSACTION_NOT_FOUND`, `ROUTE_NOT_FOUND` |
+| Conflito | `409` | `IDEMPOTENCY_CONFLICT`, `EXTERNAL_TRANSACTION_CONFLICT`, `WALLET_ALREADY_EXISTS` (com `walletId`) |
+| Falha transitória (lock timeout, conexão) | `503` + `Retry-After: 1` | `LOCK_TIMEOUT`, `LOCK_CONFLICT`, `DATABASE_UNAVAILABLE` (`retryable: true`) |
+| Erro de programação / desconhecido | `500` | `INTERNAL_ERROR`, mensagem genérica |
 
-O mesmo mapeamento vale para todos os endpoints.
+Erros usam um envelope único em todos os endpoints (filtro global `HttpErrorFilter`):
+`{ error: { code, category, message, retryable, details? }, correlationId }`. A categoria vem de
+`classifyError` (application), que o consumer SQS da fase 6 reutiliza para decidir ack / retry / DLQ.
+O replay de uma transação que estava PENDING_REFERENCE e já foi resolvida devolve o **estado atual**
+(por exemplo, `200` PROCESSED com o saldo da resolução).
 
 ## 9. Mensageria
 
@@ -188,9 +201,12 @@ O mesmo mapeamento vale para todos os endpoints.
 
 ## 11. Autenticação
 
-Fora do escopo de pontuação. Entra um `AuthGuard` no-op como ponto de extensão, e documentamos aqui o
-desenho que adotaríamos (Keycloak/OIDC, `client_credentials` por provedor, validando que o `providerId` do
-token bate com o do payload).
+Fora do escopo de pontuação. O ponto de extensão é o `ProviderAuthGuard` no-op
+(`src/interfaces/http/provider-auth.guard.ts`), aplicado aos controllers de negócio; health fica fora.
+Desenho que adotaríamos: Keycloak/OIDC, `client_credentials` por provedor; o guard valida o JWT
+(JWKS, `iss`, `aud`, `exp`), extrai o `providerId` de uma claim e exige que ele bata com o do corpo
+(`POST /wagering/transactions`) ou do path (`GET /providers/:providerId/...`), senão 403. Rotas de
+wallet e reconciliação exigiriam um papel de backoffice.
 
 ## 12. Limitações e trade-offs conhecidos
 
@@ -199,7 +215,14 @@ token bate com o do payload).
 - Os triggers diferidos de consistência (seção 15) custam duas ou três buscas por índice a cada commit
   que mexe em saldo.
 - Como o banco não deixa saldo e ledger divergirem, um teste que precise simular divergência (reconciliação,
-  fase 4) tem que desligar os triggers na sessão (`session_replication_role = replica`).
+  fase 4) tem que desligar os triggers na sessão (`session_replication_role = replica`, exige superusuário).
+  Essas wallets ficam adulteradas para sempre no banco `wagering_test` (ledger append-only) e são
+  excluídas da checagem final do teste.
+- O teste de "falha no meio do flush" depende da ordem em que o MikroORM envia os INSERTs (hoje a
+  outbox antes de `wager_transactions`). Se a ordem mudar, o teste falha com SQLSTATE `P0002` em vez
+  de passar em silêncio, e o ponto de injeção precisa ser ajustado.
+- Wallet inexistente no `POST /wagering/transactions` responde 404 sem gravar nada: a FK
+  `fk_wager_tx_wallet` não deixa persistir uma transação auditável sem wallet.
 
 ## 13. Decisões da fase 1 (scaffolding)
 
@@ -328,3 +351,53 @@ Interpretações do enunciado e escolhas de modelagem, todas cobertas por testes
     (`test/support/database.ts`), separado do `wagering` do app. O ledger é append-only, então cada teste usa
     ids novos em vez de limpar tabelas. O teste de migrations roda num banco descartável. Todo teste de
     integração termina conferindo `wallet.balance == saldo reconstruído pelo ledger`.
+
+## 16. Decisões da fase 4 (use cases e API HTTP)
+
+1. **Use cases puros na `application`** (`ProcessWagerTransaction`, `CreateWallet`, `GetWallet`,
+   `ListWalletLedger`, `GetWagerTransaction`, `ReconcileWallet`), sem decorators do Nest; o
+   `UseCasesModule` os liga aos ports por `useFactory`. Novos ports: `Clock`, `IdGenerator` (UUIDv7 via
+   `Bun.randomUUIDv7()`, ordenado no tempo), `ReconciliationReader` e `ReconciliationMonitor`.
+2. **Rejeição de negócio é resultado, não exceção.** Se fosse exceção, a UnitOfWork faria rollback e o
+   REJECTED não ficaria auditado. O use case devolve `{ transactionId, status, balance, failureCode?,
+   providerAction?, idempotentReplay }` e quem decide o status HTTP é a borda.
+3. **Núcleo compartilhado `applyWager`** (`src/application/wagering/apply-wager.ts`): resolve a
+   referência, aplica a `WagerPolicy` e registra transação, saldo, ledger e outbox no mesmo
+   `TransactionScope`. O worker de PENDING_REFERENCE (fase 7) reutiliza com `isNew: false`.
+   - A linha da referência não é travada: uma referência válida é da mesma wallet, e toda mudança em
+     transações de uma wallet exige o lock dela. `ux_wager_tx_reversal_once` é a rede de segurança.
+   - Auto-referência (`referenceExternalTransactionId == externalTransactionId`) é rejeitada na hora
+     com `REFERENCE_INVALID_KIND`, em vez de esperar por si mesma como PENDING_REFERENCE.
+4. **Eventos por desfecho:** PROCESSED → `WagerTransactionProcessed` (+ `WalletBalanceChanged` se houve
+   lançamento); REJECTED → `WagerTransactionRejected`; entrada em PENDING_REFERENCE →
+   `WagerTransactionPendingReference` (um retry sem sucesso do worker não repete o evento). A abertura da
+   wallet com saldo > 0 emite `WagerTransactionProcessed` + `WalletBalanceChanged`: toda transação
+   PROCESSED gera Processed, e todo lançamento gera BalanceChanged. Todos levam o `correlationId` da
+   requisição (`X-Correlation-Id` do cliente, se válido, ou um id novo, devolvido no header).
+5. **Normalização compartilhada por HTTP e SQS** (resolve a pendência §15.10): `playerId`/`walletId`
+   validados como UUID e convertidos para minúsculas antes do hash; `providerId = 'internal'` e
+   `kind = OPENING` dão 400. O DTO HTTP (zod) só checa forma: dinheiro como `string` (número JSON é
+   400), textos até 255 caracteres, campos desconhecidos ignorados.
+6. **Wallet duplicada:** decidida por `ux_wallets_player_currency`, sem leitura prévia. O 409 traz o
+   `walletId` existente, para o cliente se recuperar de um retry de criação.
+7. **Ledger paginado por chave em `wallet_version`**, do mais antigo ao mais novo; `limit` padrão 50,
+   máximo 200. O cursor é opaco (base64url de `{ v, w, after }`) e amarrado à wallet: cursor de outra
+   wallet, adulterado ou malformado dá 400 `INVALID_CURSOR`. Como a versão é contígua e só cresce,
+   lançamentos novos durante a paginação não repetem nem pulam linhas.
+8. **Reconciliação** numa única consulta SQL (um snapshot só em READ COMMITTED, sem travar a wallet):
+   saldo, soma de CREDIT, soma de DEBIT e contagem. `calculated = créditos − débitos` e `difference =
+   stored − calculated` em `Money` (podem ser negativos). Divergência vai para a resposta
+   (`consistent: false`) e para o `ReconciliationMonitor` (log `warn` com wallet, diferença e
+   contagem; métrica na fase 8). Nunca corrige nada.
+9. **Sem retry interno de erro transitório:** lock timeout ou conexão perdida viram 503 com
+   `Retry-After: 1`; o provedor repete com a mesma key. O único retry interno é o da corrida residual de
+   unicidade (seção 5), limitado a uma tentativa extra.
+10. **Logs de erro sem dados financeiros:** para erros do banco/driver, o filtro loga só nome, SQLSTATE
+    e constraint (a mensagem do driver traz o SQL com os parâmetros).
+11. **`POST /wagering/transactions` envia a resposta no próprio handler** (`@Res()`): o status depende do
+    resultado, e o Nest sobrescreveria um `res.status()` com o código fixo da rota.
+12. **Testes da fase** (`test/integration/http`, app Nest real numa porta aleatória contra o Postgres):
+    cada regra de negócio, replay e conflito, duas corridas determinísticas (sincronizadas por
+    `pg_stat_activity`, sem sleeps fixos), falha injetada no Postgres no meio do flush e no COMMIT
+    (triggers temporários que só disparam para operações marcadas) e 503 por `lock_timeout` com a wallet
+    travada por outra conexão. Todos terminam com `wallet.balance == saldo reconstruído pelo ledger`.

@@ -2,6 +2,7 @@ import { LockMode } from '@mikro-orm/core';
 import type { EntityManager } from '@mikro-orm/postgresql';
 import {
   type InboxRepository,
+  type LedgerPageQuery,
   type LedgerRepository,
   type OutboxRepository,
   RepositoryMisuseError,
@@ -166,6 +167,16 @@ export class MikroOrmLedgerRepository implements LedgerRepository {
   async findByTransactionId(transactionId: string): Promise<WalletLedgerEntry | undefined> {
     const record = await this.em.findOne(LedgerEntryRecord, { transactionId });
     return record ? LedgerEntryMapper.toDomain(record) : undefined;
+  }
+
+  /** Usa o índice único `ux_ledger_wallet_version (wallet_id, wallet_version)`. */
+  async listByWallet(walletId: string, page: LedgerPageQuery): Promise<WalletLedgerEntry[]> {
+    const records = await this.em.find(
+      LedgerEntryRecord,
+      { walletId, walletVersion: { $gt: page.afterWalletVersion } },
+      { orderBy: { walletVersion: 'asc' }, limit: page.limit },
+    );
+    return records.map((record) => LedgerEntryMapper.toDomain(record));
   }
 }
 

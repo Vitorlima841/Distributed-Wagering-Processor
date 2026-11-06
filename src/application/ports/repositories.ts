@@ -42,10 +42,21 @@ export interface WagerTransactionRepository {
   save(transaction: WagerTransaction): Promise<void>;
 }
 
+export interface LedgerPageQuery {
+  /** Devolve só lançamentos com `walletVersion` maior que este (0 = desde o início). */
+  afterWalletVersion: number;
+  limit: number;
+}
+
 /** Ledger append-only: não há update nem delete. */
 export interface LedgerRepository {
   append(entry: WalletLedgerEntry): Promise<void>;
   findByTransactionId(transactionId: string): Promise<WalletLedgerEntry | undefined>;
+  /**
+   * Lançamentos da wallet em ordem de `walletVersion` crescente (paginação por chave). A versão é
+   * contígua por wallet e só cresce, então páginas não se repetem nem pulam lançamentos.
+   */
+  listByWallet(walletId: string, page: LedgerPageQuery): Promise<WalletLedgerEntry[]>;
 }
 
 export interface InboxRepository {

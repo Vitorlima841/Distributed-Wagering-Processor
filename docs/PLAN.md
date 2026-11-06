@@ -72,15 +72,17 @@ Enunciado: `docs/CHALLENGE.md` · Regras: `CLAUDE.md` · Decisões: `ARCHITECTUR
       (saldo negativo, wallet duplicada, ledger UPDATE/DELETE, aritmética do ledger, reversão dupla,
       idempotency key duplicada)
 
-### Fase 4 — Use cases + API HTTP ⚠️
-- [ ] `CreateWallet` (com OPENING + ledger CREDIT na mesma transação; 409 se duplicada)
-- [ ] `ProcessWagerTransaction`: BET, WIN, LOSS, REFUND, ROLLBACK, referência ausente → PENDING_REFERENCE
-- [ ] Idempotência: replay com snapshot e conflito por hash
-- [ ] Outbox gravada na mesma transação (eventos certos para cada caso)
-- [ ] Endpoints da seção 9 (incluindo ledger com cursor opaco e reconciliação)
-- [ ] Mapeamento HTTP consistente (filtro global de exceções)
-- [ ] `AuthGuard` no-op como ponto de extensão
-- [ ] Testes de integração por regra de negócio + atomicidade (falha no meio → nada gravado)
+### Fase 4 — Use cases + API HTTP ⚠️ ✅
+- [x] `CreateWallet` (com OPENING + ledger CREDIT na mesma transação; 409 se duplicada)
+- [x] `ProcessWagerTransaction`: BET, WIN, LOSS, REFUND, ROLLBACK, referência ausente → PENDING_REFERENCE
+- [x] Idempotência: replay com snapshot e conflito por hash
+- [x] Outbox gravada na mesma transação (eventos certos para cada caso)
+- [x] Endpoints da seção 9 (incluindo ledger com cursor opaco e reconciliação)
+- [x] Mapeamento HTTP consistente (filtro global de exceções)
+- [x] `AuthGuard` no-op como ponto de extensão
+- [x] Testes de integração por regra de negócio + atomicidade (falha no meio → nada gravado)
+- [x] Extra: corridas determinísticas de idempotência (espera no lock, colisão no índice único) e
+      503 por `lock_timeout`, ver ARCHITECTURE §16
 
 ### Fase 5 — Concorrência ⚠️
 - [ ] Mesma aposta 50x em paralelo → um único débito

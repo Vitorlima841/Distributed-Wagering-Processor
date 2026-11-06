@@ -6,3 +6,5 @@ export function createLogger(level: string) {
 }
 
 export type Logger = ReturnType<typeof createLogger>;
+
+export const LOGGER = Symbol('LOGGER');
