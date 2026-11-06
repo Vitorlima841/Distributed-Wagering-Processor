@@ -26,7 +26,7 @@ SQS consumer ─inbox ─┘      (1 transação SQL)     ├─> wallet_ledger_
 
 | Camada | Contém | Pode importar |
 |---|---|---|
-| `domain` | `Money`, `Wallet`, `WagerTransaction`, `WalletLedgerEntry`, `InboxMessage`, `OutboxMessage`, `IntegrationEvent` e subclasses, erros de domínio, `FailureCode` | nada externo (só `decimal.js`) |
+| `domain` | `Money`, `Wallet`, `WagerTransaction`, `WalletLedgerEntry`, `InboxMessage`, `OutboxMessage`, `IntegrationEvent` e subclasses, erros de domínio, `FailureCode` | nada externo (só `decimal.js` e `node:crypto`, este apenas para o SHA-256 do payload) |
 | `application` | use cases, ports (`WalletRepository`, `WagerTransactionRepository`, `LedgerRepository`, `InboxRepository`, `OutboxRepository`, `UnitOfWork`, `Clock`, `IdGenerator`, `EventPublisher`) | `domain` |
 | `infrastructure` | MikroORM (`EntitySchema` + mappers), tipo customizado de `Money`, repositórios, cliente SQS, métricas, logger | tudo |
 | `interfaces` | controllers, DTOs/validação, consumer SQS, workers, health | `application` |
@@ -38,7 +38,7 @@ do ORM, e o mapeamento explícito deixa claro onde `rehydrate` é chamado.
 
 - Domínio: `decimal.js`, imutável, escala fixa de 2 casas, moeda ISO-4217.
 - Entrada aceita apenas `^\d+(\.\d{1,2})?$` (sem sinal, sem notação científica, sem vazio, no máximo 2 casas).
-  Normaliza para 2 casas (`"25"` → `"25.00"`). *Interpretação a confirmar na fase 2.*
+  Normaliza para 2 casas (`"25"` → `"25.00"`). Confirmado na fase 2 (detalhes na seção 14).
 - Banco: `numeric(20,2)` + coluna `currency char(3)`. O driver devolve string, e o tipo customizado do
   MikroORM converte string ↔ `Money`. Nunca passa por `number`.
 - Operações entre moedas diferentes lançam `CurrencyMismatchError`. O desafio roda só com `BRL`, mas o
@@ -111,8 +111,8 @@ wager_transactions(
   CHECK (kind NOT IN ('REFUND','ROLLBACK') OR reference_external_transaction_id IS NOT NULL),
   CHECK ((status IN ('REJECTED','FAILED')) = (failure_code IS NOT NULL))
 )
--- reversão única por tipo:
-CREATE UNIQUE INDEX ux_reversal_once ON wager_transactions (reference_transaction_id, kind)
+-- uma reversão por referência, de qualquer tipo (ver seção 14, item 1; mudou na fase 2):
+CREATE UNIQUE INDEX ux_reversal_once ON wager_transactions (reference_transaction_id)
   WHERE kind IN ('REFUND','ROLLBACK') AND status = 'PROCESSED';
 CREATE INDEX ix_pending_ref ON wager_transactions (next_attempt_at) WHERE status = 'PENDING_REFERENCE';
 
@@ -243,3 +243,66 @@ token bate com o do payload).
   `wager-transactions.fifo` tem redrive para a DLQ com `maxReceiveCount=5` e `ContentBasedDeduplication=false`.
 - **Porta do Postgres no host**: 5433 (a 5432 costuma estar ocupada por um Postgres local). Dentro da rede do
   compose continua 5432.
+
+## 14. Decisões da fase 2 (domínio)
+
+Interpretações do enunciado e escolhas de modelagem, todas cobertas por testes em `test/unit/domain`.
+
+1. **Uma reversão por referência, de qualquer tipo.** A regra 4 do desafio ("não revertida duas vezes pelo
+   *mesmo tipo*") permitiria `REFUND` e depois `ROLLBACK` da mesma BET, creditando duas vezes. Adotamos:
+   cada referência aceita no máximo uma reversão `PROCESSED` (REFUND ou ROLLBACK), senão `ALREADY_REVERSED`.
+   `ROLLBACK` de um `REFUND` continua válido. O índice único parcial da fase 3 é
+   `(reference_transaction_id) WHERE kind IN ('REFUND','ROLLBACK') AND status = 'PROCESSED'`.
+2. **Valores.** `BET`, `WIN`, `REFUND`, `ROLLBACK` e `OPENING` exigem valor positivo (zero é erro de validação,
+   HTTP 400). `LOSS` aceita `0.00`. Na fase 3, o schema deve refletir isso (por exemplo
+   `CHECK (kind = 'LOSS' OR amount > 0)`).
+3. **`Money`.**
+   - Entrada: precisa ser `string`; número JSON é rejeitado. Aceita `^\d+(\.\d{1,2})?$` com até 18 dígitos
+     inteiros (limite de `numeric(20,2)`). Mais de 2 casas é rejeitado, nunca arredondado, e não há
+     multiplicação nem divisão, então não existe modo de arredondamento.
+   - Moeda: `^[A-Z]{3}$`, sem normalizar minúsculas.
+   - Operações: `subtract` e `negate` podem produzir negativo (a reconciliação usa isso); serializa como
+     `"-5.00"`. Estouro do limite lança `InvalidMoneyError`. `equals` entre moedas diferentes é `false`;
+     `add`, `subtract` e `isLessThan` lançam `CurrencyMismatchError`.
+4. **Hash do payload.** SHA-256 hex (`node:crypto`, única exceção ao "só decimal.js" do domínio) do JSON
+   canônico: chaves ordenadas recursivamente, sem espaços, `undefined`/`null` omitidos (HTTP e SQS geram o
+   mesmo hash para "sem referência"), amount normalizado (`"25"` e `"25.00"` dão o mesmo hash). Campos
+   hasheados: `providerId, externalTransactionId, playerId, walletId, roundId, gameId, kind, money,
+   referenceExternalTransactionId`. O `payloadHash` do `InboxMessage` é só uma string; a fase 6 decide o que
+   hashear.
+5. **Tempo e ids vêm de fora.** O domínio não chama `new Date()` nem gera UUID; factories e transições
+   recebem `now` e ids por parâmetro (ports `Clock` e `IdGenerator` ficam na `application`).
+6. **Assinaturas ajustadas em relação ao esqueleto do desafio.**
+   - `Wallet.open` devolve `{ wallet, openingEntry? }`: saldo inicial > 0 gera CREDIT de `0.00` até o saldo,
+     e `version` fica em 1. `WagerTransaction.opening(...)` cria a transação interna
+     (`provider_id = 'internal'`, key `opening:{walletId}`).
+   - Snapshot de saldo no replay (regra 7): `markProcessed(refId, balanceAfter, at)`,
+     `reject(code, observedBalance, at)` e `markPendingReference(observedBalance, now)`. `processedAt` marca
+     qualquer transição terminal.
+   - Retry de `PENDING_REFERENCE`: `referenceAttempts` e `nextAttemptAt` vivem na transação;
+     `scheduleReferenceRetry(now)` aplica backoff 1s, 2s, 4s… com teto de 60s. `PENDING_REFERENCE →
+     PENDING_REFERENCE` só por esse método. O limite de tentativas (provisório: 10,
+     `DEFAULT_MAX_REFERENCE_ATTEMPTS`) é calibrado na fase 7.
+   - `WagerTransaction.assertReplayOf(hash)` lança `IdempotencyConflictError` quando a mesma key chega com
+     payload diferente.
+   - `fail()` só aceita `INFRA_PERMANENT_ERROR`; `reject()` aceita os demais códigos.
+7. **Erros com `category`** (`validation` → 400/DLQ, `business` → 422/ack, `conflict` → 409, `invariant` →
+   500, erro de programação). `InvalidTransactionStateError` é `invariant`: transicionar estado terminal não
+   é caminho de negócio.
+8. **Regras de referência (`ReferenceRules`) e aplicação (`WagerPolicy`).** Funções puras: o use case resolve
+   a referência por `(providerId, referenceExternalTransactionId)` e as reversões já `PROCESSED` dela, e a
+   policy devolve `PROCESSED`, `REJECTED` ou `PENDING_REFERENCE`, deixando a transação no estado certo.
+   Ordem de checagem: referência ausente → pendente; auto-referência → `REFERENCE_INVALID_KIND`; referência
+   não terminal → pendente; `REJECTED`/`FAILED` → `REFERENCE_NOT_PROCESSED`; tipo inválido →
+   `REFERENCE_INVALID_KIND`; outro provedor/player/wallet/moeda/rodada → `REFERENCE_MISMATCH`; já revertida
+   → `ALREADY_REVERSED`; valor diferente → `AMOUNT_MISMATCH`. Antes disso, a policy checa a wallet:
+   `WALLET_PLAYER_MISMATCH` e `CURRENCY_MISMATCH` (rejeição auditável). Falta de saldo vira
+   `INSUFFICIENT_FUNDS` na BET e `REVERSAL_INSUFFICIENT_FUNDS` no ROLLBACK. Esgotadas as tentativas de
+   referência: `REFERENCE_NOT_FOUND`.
+9. **Referência em WIN/LOSS é informativa**: é guardada e entra no hash, mas não é resolvida nem exigida
+   (o desafio só diz que o WIN "pode referenciar" a BET). BET não aceita referência.
+10. **Eventos.** `aggregateId` é a transação nos eventos de transação e a wallet no `WalletBalanceChanged`.
+    `data` carrega só `MoneyProps` e é congelada. `WagerTransactionRejected` inclui `providerAction`
+    (`give_up`, `fix_payload`, `investigate`, `contact_support`) derivada do `failureCode`.
+    `OutboxMessage.enqueue` usa o `eventId` como id, grava `event.toJSON()` como payload e vence no instante do
+    evento. Backoff de publicação: 1s × 2^(tentativas−1), teto de 60s, sem jitter.

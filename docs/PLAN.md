@@ -47,18 +47,18 @@ Enunciado: `docs/CHALLENGE.md` · Regras: `CLAUDE.md` · Decisões: `ARCHITECTUR
 - [x] Um teste trivial de integração conectando no Postgres real
 - [x] README com setup inicial
 
-### Fase 2 — Domínio + testes unitários
-- [ ] `Money` (decimal.js, escala 2, validação de entrada, conflito de moeda, imutável)
-- [ ] `Wallet` (open, rehydrate, debit/credit que retornam o `WalletLedgerEntry`, version)
-- [ ] `WagerTransaction` (create/rehydrate, transições, `requiresReference`, `affectsBalance`,
+### Fase 2 — Domínio + testes unitários ✅
+- [x] `Money` (decimal.js, escala 2, validação de entrada, conflito de moeda, imutável)
+- [x] `Wallet` (open, rehydrate, debit/credit que retornam o `WalletLedgerEntry`, version)
+- [x] `WagerTransaction` (create/rehydrate, transições, `requiresReference`, `affectsBalance`,
       `ledgerDirectionFor`, `matchesPayload`)
-- [ ] `WalletLedgerEntry` (imutável, `isBalanced` checado na factory)
-- [ ] `InboxMessage`, `OutboxMessage` (com `scheduleRetry` e backoff)
-- [ ] `IntegrationEvent` abstrata + 4 subclasses
-- [ ] `FailureCode` e erros de domínio
-- [ ] Serviço de domínio de regras de referência (REFUND/ROLLBACK)
-- [ ] Hash canônico do payload (função pura)
-- [ ] Testes unitários de tudo acima (incluindo idempotency key com payload divergente)
+- [x] `WalletLedgerEntry` (imutável, `isBalanced` checado na factory)
+- [x] `InboxMessage`, `OutboxMessage` (com `scheduleRetry` e backoff)
+- [x] `IntegrationEvent` abstrata + 4 subclasses
+- [x] `FailureCode` e erros de domínio
+- [x] Serviço de domínio de regras de referência (REFUND/ROLLBACK)
+- [x] Hash canônico do payload (função pura)
+- [x] Testes unitários de tudo acima (incluindo idempotency key com payload divergente)
 
 ### Fase 3 — Schema e persistência ⚠️
 - [ ] Migrations reversíveis com todas as tabelas, constraints, índices e o trigger do ledger
