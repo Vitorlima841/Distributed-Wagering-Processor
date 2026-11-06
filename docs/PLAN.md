@@ -60,13 +60,15 @@ Enunciado: `docs/CHALLENGE.md` · Regras: `CLAUDE.md` · Decisões: `ARCHITECTUR
 - [x] Hash canônico do payload (função pura)
 - [x] Testes unitários de tudo acima (incluindo idempotency key com payload divergente)
 
-### Fase 3 — Schema e persistência ⚠️
-- [ ] Migrations reversíveis com todas as tabelas, constraints, índices e o trigger do ledger
-- [ ] Tipo customizado `Money` ↔ `numeric(20,2)` (sem passar por `number`)
-- [ ] `EntitySchema` + mappers (domínio ↔ persistência usando `rehydrate`)
-- [ ] Repositórios implementando os ports + `UnitOfWork` sobre `em.transactional()`
-- [ ] `findByIdForUpdate` com `LockMode.PESSIMISTIC_WRITE`
-- [ ] Testes de integração: migrations up/down; cada constraint barra o dado inválido
+### Fase 3 — Schema e persistência ⚠️ ✅
+- [x] Migrations reversíveis com todas as tabelas, constraints, índices e o trigger do ledger
+- [x] Tipo customizado `Money` ↔ `numeric(20,2)` (sem passar por `number`): `DecimalAmountType` + mapper
+- [x] `EntitySchema` + mappers (domínio ↔ persistência usando `rehydrate`)
+- [x] Repositórios implementando os ports + `UnitOfWork` sobre `em.transactional()`
+- [x] `findByIdForUpdate` com `LockMode.PESSIMISTIC_WRITE`
+- [x] Extra: guardas de UPDATE, FKs compostas e consistência saldo ↔ ledger ↔ transação no COMMIT
+      (`walletVersion` no lançamento), ver ARCHITECTURE §15
+- [x] Testes de integração: migrations up/down; cada constraint barra o dado inválido
       (saldo negativo, wallet duplicada, ledger UPDATE/DELETE, aritmética do ledger, reversão dupla,
       idempotency key duplicada)
 

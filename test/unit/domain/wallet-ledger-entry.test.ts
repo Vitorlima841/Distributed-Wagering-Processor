@@ -11,6 +11,7 @@ const base = {
   id: 'entry-1',
   walletId: WALLET_ID,
   transactionId: 'tx-1',
+  walletVersion: 2,
   createdAt: T0,
 };
 
@@ -110,6 +111,21 @@ describe('WalletLedgerEntry.create', () => {
         balanceAfter: brl('1.00'),
       }),
     ).toThrow(InvalidFieldError);
+  });
+
+  test('rejeita walletVersion que não seja inteiro >= 1', () => {
+    for (const walletVersion of [0, -1, 1.5, Number.NaN]) {
+      expect(() =>
+        WalletLedgerEntry.create({
+          ...base,
+          walletVersion,
+          direction: LedgerDirection.Credit,
+          money: brl('1.00'),
+          balanceBefore: brl('0.00'),
+          balanceAfter: brl('1.00'),
+        }),
+      ).toThrow(InvalidFieldError);
+    }
   });
 });
 

@@ -15,6 +15,12 @@ describe('parseConfig', () => {
     expect(cfg.queues.wager).toBe('wager-transactions.fifo');
     expect(cfg.queues.wagerDlq).toBe('wager-transactions-dlq.fifo');
     expect(cfg.queues.events).toBe('wagering-events');
+    expect(cfg.dbLockTimeoutMs).toBe(5000);
+  });
+
+  test('falha com DB_LOCK_TIMEOUT_MS inválido', () => {
+    expect(() => parseConfig({ ...base, DB_LOCK_TIMEOUT_MS: '0' })).toThrow(/DB_LOCK_TIMEOUT_MS/);
+    expect(() => parseConfig({ ...base, DB_LOCK_TIMEOUT_MS: '1.5' })).toThrow(ConfigError);
   });
 
   test('aceita cada ROLE válido', () => {

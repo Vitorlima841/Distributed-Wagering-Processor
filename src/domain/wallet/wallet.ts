@@ -79,6 +79,7 @@ export class Wallet {
       money: initialBalance,
       balanceBefore: initialBalance.subtract(initialBalance),
       balanceAfter: initialBalance,
+      walletVersion: 1,
       createdAt: now,
     });
     return { wallet, openingEntry };
@@ -136,6 +137,7 @@ export class Wallet {
       money: props.money,
       balanceBefore: this._balance,
       balanceAfter: newBalance,
+      walletVersion: this._version + 1,
       createdAt: props.now,
     });
     this._balance = newBalance;

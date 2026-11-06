@@ -64,13 +64,17 @@ Veja [.env.example](.env.example).
 | `bun run lint` / `lint:fix` | Biome |
 | `bun run migration:up` / `migration:down` | aplica / reverte uma migration |
 
+Os testes de integração usam o banco `wagering_test` (no mesmo Postgres do compose), criado e migrado
+automaticamente na primeira execução. O ledger é append-only, então os testes não limpam tabelas: cada um
+usa ids novos. Para recomeçar do zero: `docker compose exec postgres dropdb -U wagering wagering_test`.
+
 ## Estrutura
 
 ```
 src/
   domain/          # TS puro (sem NestJS/MikroORM/AWS)
   application/     # use cases + ports
-  infrastructure/  # config, MikroORM, logger, (SQS, outbox...)
+  infrastructure/  # config, MikroORM (records, mappers, repositórios, UnitOfWork), logger, (SQS, outbox...)
   interfaces/      # HTTP, consumer SQS, workers
 migrations/        # reversíveis (up/down), registradas em mikro-orm.config.ts
 test/{unit,integration,concurrency}

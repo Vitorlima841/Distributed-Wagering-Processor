@@ -1,4 +1,4 @@
-import { InvalidAmountError, UnbalancedLedgerEntryError } from '../errors';
+import { InvalidAmountError, InvalidFieldError, UnbalancedLedgerEntryError } from '../errors';
 import type { Money } from '../money/money';
 import { assertNonEmpty } from '../shared/assert';
 
@@ -15,6 +15,8 @@ export interface LedgerEntryState {
   money: Money;
   balanceBefore: Money;
   balanceAfter: Money;
+  /** Versão da wallet depois deste lançamento (encadeia o ledger da wallet no banco). */
+  walletVersion: number;
   createdAt: Date;
 }
 
@@ -32,6 +34,7 @@ export class WalletLedgerEntry {
   readonly money: Money;
   readonly balanceBefore: Money;
   readonly balanceAfter: Money;
+  readonly walletVersion: number;
   readonly createdAt: Date;
 
   private constructor(state: LedgerEntryState) {
@@ -42,6 +45,7 @@ export class WalletLedgerEntry {
     this.money = state.money;
     this.balanceBefore = state.balanceBefore;
     this.balanceAfter = state.balanceAfter;
+    this.walletVersion = state.walletVersion;
     this.createdAt = state.createdAt;
     Object.freeze(this);
   }
@@ -51,6 +55,9 @@ export class WalletLedgerEntry {
     assertNonEmpty('id', props.id);
     assertNonEmpty('walletId', props.walletId);
     assertNonEmpty('transactionId', props.transactionId);
+    if (!Number.isInteger(props.walletVersion) || props.walletVersion < 1) {
+      throw new InvalidFieldError('walletVersion', 'deve ser um inteiro >= 1');
+    }
     if (!props.money.isPositive()) {
       throw new InvalidAmountError(`Lançamento exige valor positivo, recebido ${props.money}`);
     }

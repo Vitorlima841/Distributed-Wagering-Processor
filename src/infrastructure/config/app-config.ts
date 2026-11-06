@@ -11,6 +11,7 @@ const schema = z.object({
     .string()
     .min(1)
     .refine((v) => /^postgres(ql)?:\/\//.test(v), 'DATABASE_URL deve começar com postgres://'),
+  DB_LOCK_TIMEOUT_MS: z.coerce.number().int().min(1).default(5000),
   AWS_REGION: z.string().min(1).default('us-east-1'),
   AWS_ACCESS_KEY_ID: z.string().min(1),
   AWS_SECRET_ACCESS_KEY: z.string().min(1),
@@ -25,6 +26,8 @@ export interface AppConfig {
   port: number;
   logLevel: string;
   databaseUrl: string;
+  /** Espera máxima por um lock de linha (ex.: wallet disputada) antes de falhar como transitório. */
+  dbLockTimeoutMs: number;
   aws: {
     region: string;
     accessKeyId: string;
@@ -51,6 +54,7 @@ export function parseConfig(env: Record<string, string | undefined>): AppConfig 
     port: e.PORT,
     logLevel: e.LOG_LEVEL,
     databaseUrl: e.DATABASE_URL,
+    dbLockTimeoutMs: e.DB_LOCK_TIMEOUT_MS,
     aws: {
       region: e.AWS_REGION,
       accessKeyId: e.AWS_ACCESS_KEY_ID,

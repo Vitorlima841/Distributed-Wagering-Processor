@@ -54,6 +54,7 @@ describe('Wallet.open', () => {
     expect(openingEntry?.balanceAfter.toString()).toBe('1000.00 BRL');
     expect(openingEntry?.transactionId).toBe('tx-opening');
     expect(openingEntry?.walletId).toBe(WALLET_ID);
+    expect(openingEntry?.walletVersion).toBe(1);
   });
 
   test('saldo inicial zero: sem lançamento, version=1', () => {
@@ -102,6 +103,7 @@ describe('Wallet.debit / credit', () => {
     expect(entry.balanceBefore.toString()).toBe('100.00 BRL');
     expect(entry.balanceAfter.toString()).toBe('20.00 BRL');
     expect(entry.walletId).toBe(wallet.id);
+    expect(entry.walletVersion).toBe(wallet.version);
     expect(entry.isBalanced()).toBe(true);
   });
 
@@ -113,6 +115,7 @@ describe('Wallet.debit / credit', () => {
     expect(entry.direction).toBe(LedgerDirection.Credit);
     expect(entry.balanceBefore.toString()).toBe('100.00 BRL');
     expect(entry.balanceAfter.toString()).toBe('125.50 BRL');
+    expect(entry.walletVersion).toBe(2);
   });
 
   test('débito exato do saldo zera a wallet (saldo nunca fica negativo)', () => {

@@ -39,8 +39,10 @@ do ORM, e o mapeamento explícito deixa claro onde `rehydrate` é chamado.
 - Domínio: `decimal.js`, imutável, escala fixa de 2 casas, moeda ISO-4217.
 - Entrada aceita apenas `^\d+(\.\d{1,2})?$` (sem sinal, sem notação científica, sem vazio, no máximo 2 casas).
   Normaliza para 2 casas (`"25"` → `"25.00"`). Confirmado na fase 2 (detalhes na seção 14).
-- Banco: `numeric(20,2)` + coluna `currency char(3)`. O driver devolve string, e o tipo customizado do
-  MikroORM converte string ↔ `Money`. Nunca passa por `number`.
+- Banco: `numeric(20,2)` + coluna `currency char(3)`. O driver `pg` devolve `numeric` como string; o tipo
+  customizado `DecimalAmountType` mapeia `numeric(20,2)` ↔ string `"25.00"` e recusa `number` nos dois
+  sentidos. Como um tipo do MikroORM enxerga uma coluna só, o `Money` (valor + moeda) é montado no mapper.
+  Nunca passa por `number`.
 - Operações entre moedas diferentes lançam `CurrencyMismatchError`. O desafio roda só com `BRL`, mas o
   modelo é multi-moeda e isso é testado.
 
@@ -83,66 +85,34 @@ os workers.
   que faz rollback, relê e responde replay ou conflito.
 - Inbox do SQS: PK `(consumer_name, message_id)` na mesma transação.
 
-## 6. Schema (rascunho)
+## 6. Schema
 
-```sql
-wallets(
-  id uuid PK, player_id uuid NOT NULL, currency char(3) NOT NULL,
-  balance numeric(20,2) NOT NULL CHECK (balance >= 0),
-  version int NOT NULL CHECK (version >= 1),
-  created_at timestamptz, updated_at timestamptz,
-  UNIQUE (player_id, currency)
-)
+Fonte da verdade: [`migrations/Migration20261106120000_wagering_schema.ts`](migrations/Migration20261106120000_wagering_schema.ts).
+Tabelas `wallets`, `wager_transactions`, `wallet_ledger_entries`, `inbox_messages` e `outbox_messages`.
+Dinheiro em `numeric(20,2)` + `char(3)`, ids `uuid`, horários `timestamptz`. Convenção de nomes: `pk_`,
+`ux_` (único), `fk_`, `ck_` (CHECK), `ix_` (índice), `tg_` (trigger).
 
-wager_transactions(
-  id uuid PK, provider_id text, external_transaction_id text,
-  idempotency_key text NOT NULL UNIQUE, payload_hash char(64) NOT NULL,
-  wallet_id uuid FK -> wallets, player_id uuid, round_id text, game_id text,
-  kind text CHECK (kind IN ('OPENING','BET','WIN','LOSS','REFUND','ROLLBACK')),
-  amount numeric(20,2) CHECK (amount >= 0), currency char(3),
-  reference_external_transaction_id text NULL,
-  reference_transaction_id uuid NULL FK -> wager_transactions,
-  status text CHECK (status IN ('PENDING','PENDING_REFERENCE','PROCESSED','REJECTED','FAILED')),
-  failure_code text NULL,
-  balance_after numeric(20,2) NULL,          -- snapshot para replay
-  attempts int DEFAULT 0, next_attempt_at timestamptz NULL,   -- worker PENDING_REFERENCE
-  created_at timestamptz, processed_at timestamptz NULL,
-  UNIQUE (provider_id, external_transaction_id),
-  CHECK (kind NOT IN ('REFUND','ROLLBACK') OR reference_external_transaction_id IS NOT NULL),
-  CHECK ((status IN ('REJECTED','FAILED')) = (failure_code IS NOT NULL))
-)
--- uma reversão por referência, de qualquer tipo (ver seção 14, item 1; mudou na fase 2):
-CREATE UNIQUE INDEX ux_reversal_once ON wager_transactions (reference_transaction_id)
-  WHERE kind IN ('REFUND','ROLLBACK') AND status = 'PROCESSED';
-CREATE INDEX ix_pending_ref ON wager_transactions (next_attempt_at) WHERE status = 'PENDING_REFERENCE';
+Garantias aplicadas no banco (restrição 9), cada uma coberta em `test/integration/schema-constraints.test.ts`:
 
-wallet_ledger_entries(
-  id uuid PK, seq bigserial UNIQUE,            -- cursor estável da paginação
-  wallet_id uuid FK, transaction_id uuid FK,
-  direction text CHECK (direction IN ('DEBIT','CREDIT')),
-  amount numeric(20,2) CHECK (amount > 0), currency char(3),
-  balance_before numeric(20,2) CHECK (balance_before >= 0),
-  balance_after  numeric(20,2) CHECK (balance_after  >= 0),
-  created_at timestamptz,
-  UNIQUE (transaction_id, wallet_id),
-  CHECK ((direction = 'CREDIT' AND balance_after = balance_before + amount)
-      OR (direction = 'DEBIT'  AND balance_after = balance_before - amount))
-)
--- trigger BEFORE UPDATE OR DELETE -> RAISE EXCEPTION (ledger imutável)
+| Garantia | Como |
+|---|---|
+| Saldo nunca negativo | `ck_wallets_balance_non_negative`, `ck_ledger_balances_non_negative`, `ck_wager_tx_snapshot_non_negative` |
+| Uma wallet por player + moeda | `ux_wallets_player_currency` |
+| Idempotência | `ux_wager_tx_idempotency_key`, `ux_wager_tx_provider_external` |
+| Uma abertura por wallet | `ck_wager_tx_opening` + `ck_wager_tx_opening_shape` (key `opening:{walletId}`, que é única) |
+| Uma reversão `PROCESSED` por referência | índice único parcial `ux_wager_tx_reversal_once` + `ck_wager_tx_resolved_reference` (sem ele, um `NULL` escaparia do índice) |
+| No máximo um lançamento por transação (logo, por wallet) | `ux_ledger_transaction` + FK composta `fk_ledger_transaction_wallet` |
+| Aritmética do lançamento | `ck_ledger_arithmetic`, `ck_ledger_amount_positive` |
+| Ledger imutável | `tg_ledger_append_only` (UPDATE/DELETE), `tg_ledger_no_truncate` |
+| Moeda do lançamento = moeda da wallet | FK composta `fk_ledger_wallet_currency` |
+| Reversão aponta para transação da mesma wallet | FK composta `fk_wager_tx_reference_same_wallet` |
+| Máquina de estados da transação | CHECKs `ck_wager_tx_*` (`failure_code` ⇔ REJECTED/FAILED, `processed_at` ⇔ terminal, `next_attempt_at` ⇔ PENDING_REFERENCE…) + `tg_wager_tx_guard_update` (terminal não muda, campos de negócio imutáveis) |
+| Transação não é apagada (REJECTED também é auditoria) | `tg_wager_tx_no_delete`, `tg_wager_tx_no_truncate` |
+| `version` sobe 1 só quando o saldo muda; UPDATE sobre leitura antiga falha | `tg_wallets_guard_update` |
+| Saldo ↔ ledger ↔ transação consistentes no COMMIT | `ux_ledger_wallet_version`, `tg_ledger_consistency`, `tg_wallet_matches_ledger`, `tg_wager_tx_has_entry` (seção 15) |
 
-inbox_messages(
-  consumer_name text, message_id text, payload_hash char(64),
-  received_at timestamptz, processed_at timestamptz NULL,
-  PRIMARY KEY (consumer_name, message_id)
-)
-
-outbox_messages(
-  id uuid PK (= eventId), aggregate_id uuid, event_type text, payload jsonb,
-  occurred_at timestamptz, attempts int DEFAULT 0,
-  next_attempt_at timestamptz DEFAULT now(), published_at timestamptz NULL
-)
-CREATE INDEX ix_outbox_due ON outbox_messages (next_attempt_at) WHERE published_at IS NULL;
-```
+Índices de acesso: `ix_wager_tx_pending_reference_due` (worker), `ix_outbox_due` (publisher) e
+`ux_ledger_wallet_seq` (cursor do ledger por wallet; estável porque o lock da wallet serializa os inserts).
 
 A transação `OPENING` usa `provider_id = 'internal'` e `idempotency_key = 'opening:{walletId}'`.
 A API e a fila rejeitam `kind = OPENING`.
@@ -224,7 +194,12 @@ token bate com o do payload).
 
 ## 12. Limitações e trade-offs conhecidos
 
-*(preencher ao longo das fases)*
+- O `down` da migration de schema apaga o ledger. Existe porque o desafio exige migrations reversíveis;
+  não é operação de produção.
+- Os triggers diferidos de consistência (seção 15) custam duas ou três buscas por índice a cada commit
+  que mexe em saldo.
+- Como o banco não deixa saldo e ledger divergirem, um teste que precise simular divergência (reconciliação,
+  fase 4) tem que desligar os triggers na sessão (`session_replication_role = replica`).
 
 ## 13. Decisões da fase 1 (scaffolding)
 
@@ -306,3 +281,50 @@ Interpretações do enunciado e escolhas de modelagem, todas cobertas por testes
     (`give_up`, `fix_payload`, `investigate`, `contact_support`) derivada do `failureCode`.
     `OutboxMessage.enqueue` usa o `eventId` como id, grava `event.toJSON()` como payload e vence no instante do
     evento. Backoff de publicação: 1s × 2^(tentativas−1), teto de 60s, sem jitter.
+
+## 15. Decisões da fase 3 (schema e persistência)
+
+1. **Records + mappers.** O ORM mapeia classes de persistência planas (`entity-schemas.ts`), sem relações
+   declaradas; `mappers.ts` converte para o domínio sempre via `rehydrate`. O domínio continua sem importar
+   MikroORM.
+2. **FKs `DEFERRABLE INITIALLY DEFERRED`.** No flush, o MikroORM faz todos os INSERTs antes dos UPDATEs e só
+   ordena tabelas por relações declaradas. Com records planos, a ordem entre tabelas não é garantida, então
+   as FKs são checadas no COMMIT. Nada inválido é confirmado.
+3. **Consistência cruzada no COMMIT** (constraint triggers diferidos, independentes da ordem dos comandos):
+   - `tg_ledger_consistency`: só há lançamento para transação PROCESSED que move saldo, com o mesmo valor e
+     moeda e direção coerente com o kind (ROLLBACK é o inverso da referência); `balance_before` é o
+     `balance_after` do lançamento anterior (versão − 1), ou 0.00 no primeiro; o último lançamento bate com
+     a wallet.
+   - `tg_wallet_matches_ledger`: saldo e `version` da wallet são os do último lançamento (sem lançamentos:
+     0.00 e 1).
+   - `tg_wager_tx_has_entry`: toda transação PROCESSED que move saldo tem lançamento.
+   - Para isso, `WalletLedgerEntry` ganhou `walletVersion` (versão da wallet depois do lançamento; a
+     abertura é 1). `UNIQUE (wallet_id, wallet_version)` faz colidir dois lançamentos calculados sobre a
+     mesma leitura.
+   - A reconciliação da fase 4 continua necessária como auditoria (soma de créditos − débitos).
+4. **`balance_after_currency`.** O snapshot de saldo do replay é da wallet, e numa rejeição
+   `CURRENCY_MISMATCH` a moeda da wallet difere da moeda da transação.
+5. **Sem CHECK de ordem temporal** (`updated_at >= created_at` etc.): os horários vêm do relógio de
+   instâncias diferentes, e uma diferença entre relógios derrubaria uma transação válida.
+6. **Erros.** Triggers lançam SQLSTATE 23000 com `CONSTRAINT = nome do trigger`. A UnitOfWork traduz pelo
+   SQLSTATE e pelo nome: 23505 → `UniqueViolationError(constraint)` (`conflict`); 40001, 40P01, 55P03 e
+   falha de conexão → `TransientPersistenceError` (`transient`); demais 23xxx → `IntegrityViolationError`
+   (`invariant`, bug). Erros de domínio passam intactos.
+7. **UnitOfWork.** `orm.em.fork().transactional(...)` em **READ COMMITTED**: depois do `FOR UPDATE`, cada
+   comando lê o último estado confirmado. Em REPEATABLE READ, o `FOR UPDATE` falharia com erro de
+   serialização sempre que outra instância alterasse a wallet. Cada transação roda
+   `SET LOCAL lock_timeout` (`DB_LOCK_TIMEOUT_MS`, padrão 5000); se estourar, vira erro transitório.
+8. **Lock.** `findByIdForUpdate` usa `LockMode.PESSIMISTIC_WRITE` com `refresh: true` (o MikroORM vai ao
+   banco, e os valores travados substituem os do identity map). `WalletRepository.save` exige que a wallet
+   tenha sido travada (ou criada) na mesma UnitOfWork: read → calculate → update sem lock falha também no
+   código (`RepositoryMisuseError`).
+9. **CHECKs são avaliados em ordem alfabética** pelo Postgres: uma direção inválida no ledger aparece como
+   `ck_ledger_arithmetic`, que também a cobre. `ck_ledger_direction` fica como documentação.
+10. **Pendências para a fase 4.** Recusar `providerId = 'internal'` na borda (400), porque o schema reserva
+    esse provedor para OPENING. Validar `playerId`/`walletId` como UUID e normalizar para minúsculas: o
+    Postgres devolve UUID em minúsculas, e um UUID em maiúsculas viraria erro 22P02 (500) ou um falso
+    `WALLET_PLAYER_MISMATCH`.
+11. **Testes.** Integração usa o banco `wagering_test`, criado e migrado sob demanda
+    (`test/support/database.ts`), separado do `wagering` do app. O ledger é append-only, então cada teste usa
+    ids novos em vez de limpar tabelas. O teste de migrations roda num banco descartável. Todo teste de
+    integração termina conferindo `wallet.balance == saldo reconstruído pelo ledger`.
