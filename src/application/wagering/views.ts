@@ -19,6 +19,8 @@ export interface WagerTransactionOutcome {
   failureCode?: FailureCode;
   providerAction?: ProviderAction;
   idempotentReplay: boolean;
+  /** Só na entrada por fila: a mesma mensagem já tinha sido processada (inbox). */
+  duplicateDelivery?: boolean;
 }
 
 export function toOutcome(

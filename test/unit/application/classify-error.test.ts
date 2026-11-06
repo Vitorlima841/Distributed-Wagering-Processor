@@ -14,6 +14,7 @@ import {
 import {
   CurrencyMismatchError,
   IdempotencyConflictError,
+  InboxMessageConflictError,
   InsufficientFundsError,
   InvalidMoneyError,
   InvalidTransactionStateError,
@@ -26,6 +27,7 @@ describe('classifyError (uma classificação para HTTP e SQS)', () => {
     [new WalletNotFoundError('w'), 'not_found', 'WALLET_NOT_FOUND'],
     [new WagerTransactionNotFoundError('t'), 'not_found', 'TRANSACTION_NOT_FOUND'],
     [new IdempotencyConflictError('k'), 'conflict', 'IDEMPOTENCY_CONFLICT'],
+    [new InboxMessageConflictError('c', 'm'), 'conflict', 'INBOX_MESSAGE_CONFLICT'],
     [new ExternalTransactionConflictError('p', 'e'), 'conflict', 'EXTERNAL_TRANSACTION_CONFLICT'],
     [new WalletAlreadyExistsError('p', 'BRL', undefined), 'conflict', 'WALLET_ALREADY_EXISTS'],
     [new UniqueViolationError('ux_x'), 'conflict', 'CONCURRENT_CONFLICT'],

@@ -4,14 +4,23 @@ import { NestFactory } from '@nestjs/core';
 import { AppModule } from '../../src/app.module';
 import { parseConfig } from '../../src/infrastructure/config/app-config';
 import { ensureTestDatabase } from '../support/database';
+import { TestQueues } from '../support/sqs';
 
 describe('GET /health/live', () => {
   let app: INestApplication;
   let baseUrl: string;
+  let queues: TestQueues;
 
   beforeAll(async () => {
     await ensureTestDatabase();
-    const config = parseConfig({ ...process.env, ROLE: 'all' });
+    // ROLE=all liga o consumer de verdade: filas próprias, para não consumir a fila do ambiente
+    queues = await TestQueues.create();
+    const config = parseConfig({
+      ...process.env,
+      ...queues.consumerEnv(),
+      ROLE: 'all',
+      LOG_LEVEL: 'silent',
+    });
     app = await NestFactory.create(AppModule.forRole(config), { logger: false });
     await app.listen(0);
     baseUrl = await app.getUrl();
@@ -19,6 +28,7 @@ describe('GET /health/live', () => {
 
   afterAll(async () => {
     await app.close();
+    await queues.destroy();
   });
 
   test('responde 200 sem autenticação', async () => {

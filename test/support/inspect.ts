@@ -139,3 +139,28 @@ export function outboxByCorrelation(orm: MikroORM, correlationId: string): Promi
     [correlationId],
   );
 }
+
+export interface InboxState {
+  consumerName: string;
+  messageId: string;
+  payloadHash: string;
+  /** timestamptz cru (string), como o driver devolve em `execute`. */
+  processedAt: string | null;
+}
+
+/** Linhas da inbox de um consumer (todas, ou só as dos messageIds informados). */
+export function inboxOf(
+  orm: MikroORM,
+  consumerName: string,
+  messageIds?: readonly string[],
+): Promise<InboxState[]> {
+  return query<InboxState>(
+    orm,
+    `select consumer_name as "consumerName", message_id as "messageId",
+            payload_hash as "payloadHash", processed_at as "processedAt"
+       from inbox_messages
+      where consumer_name = ? ${messageIds ? "and message_id = any(string_to_array(?, ','))" : ''}
+      order by received_at, message_id`,
+    messageIds ? [consumerName, messageIds.join(',')] : [consumerName],
+  );
+}

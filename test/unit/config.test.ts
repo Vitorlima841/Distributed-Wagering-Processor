@@ -62,6 +62,39 @@ describe('parseConfig', () => {
     expect(() => parseConfig(rest)).toThrow(/DATABASE_URL/);
   });
 
+  test('consumer SQS: defaults e validação', () => {
+    expect(parseConfig(base).consumer).toEqual({
+      name: 'wager-transactions-consumer',
+      waitTimeSeconds: 10,
+      maxMessages: 10,
+      visibilityTimeoutS: 30,
+      retryBaseDelayS: 2,
+      retryMaxDelayS: 60,
+      shutdownTimeoutMs: 15_000,
+    });
+    const custom = parseConfig({
+      ...base,
+      SQS_CONSUMER_NAME: 'consumer-b',
+      SQS_WAIT_TIME_SECONDS: '1',
+      SQS_MAX_MESSAGES: '5',
+      SQS_VISIBILITY_TIMEOUT_S: '3',
+      SQS_RETRY_BASE_DELAY_S: '1',
+      SQS_RETRY_MAX_DELAY_S: '1',
+      SQS_SHUTDOWN_TIMEOUT_MS: '500',
+    }).consumer;
+    expect(custom).toMatchObject({ name: 'consumer-b', waitTimeSeconds: 1, retryMaxDelayS: 1 });
+    expect(() => parseConfig({ ...base, SQS_WAIT_TIME_SECONDS: '21' })).toThrow(
+      /SQS_WAIT_TIME_SECONDS/,
+    );
+    expect(() => parseConfig({ ...base, SQS_MAX_MESSAGES: '11' })).toThrow(/SQS_MAX_MESSAGES/);
+    expect(() => parseConfig({ ...base, SQS_CONSUMER_NAME: 'com espaço' })).toThrow(
+      /SQS_CONSUMER_NAME/,
+    );
+    expect(() =>
+      parseConfig({ ...base, SQS_RETRY_BASE_DELAY_S: '10', SQS_RETRY_MAX_DELAY_S: '5' }),
+    ).toThrow(/SQS_RETRY_MAX_DELAY_S/);
+  });
+
   test('falha com DATABASE_URL que não é postgres', () => {
     expect(() => parseConfig({ ...base, DATABASE_URL: 'mysql://x' })).toThrow(ConfigError);
   });

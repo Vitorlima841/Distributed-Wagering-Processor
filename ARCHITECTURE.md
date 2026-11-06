@@ -212,15 +212,20 @@ O replay de uma transação que estava PENDING_REFERENCE e já foi resolvida dev
 
 ## 9. Mensageria
 
-**Consumer (`wager-transactions.fifo`):**
-- Long polling. `MessageGroupId = walletId` (otimização de ordem), `MessageDeduplicationId = messageId`.
-- Inbox na mesma transação SQL. **Ack (delete) só depois do commit.**
-- Erro de negócio → ack (o resultado já está persistido como REJECTED).
-- Erro transitório → sem ack; `ChangeMessageVisibility` com backoff.
-- Erro permanente (mensagem malformada) → DLQ.
-- Redrive policy `maxReceiveCount = 5` → `wager-transactions-dlq.fifo`.
-- `SIGTERM`: para de buscar mensagens, termina as que estão em andamento e devolve a visibilidade das demais
-  (`enableShutdownHooks`).
+**Consumer (`wager-transactions.fifo`)**, detalhes na seção 18:
+- Long polling (10s, até 10 mensagens). `MessageGroupId = walletId` (otimização de ordem),
+  `MessageDeduplicationId = messageId`. Grupos em paralelo; mensagens do mesmo grupo em ordem.
+- Chama o mesmo `ProcessWagerTransaction` do HTTP, com a entrega `(consumerName, messageId)`: a inbox
+  é consultada e gravada na mesma transação SQL do efeito. **Ack (DeleteMessage) só depois que o use
+  case volta, ou seja, depois do COMMIT.**
+- Resultado de negócio (PROCESSED, REJECTED, PENDING_REFERENCE, replay, reentrega) → ack.
+- Erro transitório (lock timeout, deadlock, banco fora, corrida de unicidade) e erro interno → sem ack;
+  `ChangeMessageVisibility` = min(2s × 2^(n−1), 60s), com n = `ApproximateReceiveCount`.
+- Erro permanente (mensagem malformada, validação, conflito, wallet inexistente) → DLQ na hora, com o
+  motivo nos atributos.
+- Redrive policy `maxReceiveCount = 5` → `wager-transactions-dlq.fifo` (cerca de 1 min de tentativas).
+- `SIGTERM`: não busca mais, termina a mensagem em andamento de cada grupo e devolve as demais com
+  visibilidade 0 (`enableShutdownHooks`).
 
 **Outbox publisher:**
 - Loop: `SELECT ... WHERE published_at IS NULL AND next_attempt_at <= now() ORDER BY occurred_at
@@ -274,6 +279,20 @@ wallet e reconciliação exigiriam um papel de backoffice.
   a conexão. Nesse meio-tempo, só aquela wallet responde 503 (`lock_timeout`). A correção não é
   afetada: sem COMMIT, nada é confirmado. A mitigação seria `SET LOCAL idle_in_transaction_session_timeout`
   na UnitOfWork; ainda não está feita (seção 17).
+- **Consumer SQS** (seção 18):
+  - Mensagens que estavam com uma instância morta sem aviso (SIGKILL) só voltam depois da visibilidade
+    (30s). A correção não muda: a reentrega cai na inbox.
+  - A visibilidade não é estendida durante o processamento (sem heartbeat). Se um lote demorar mais que
+    30s (muitas mensagens do mesmo grupo esperando uma wallet disputada), a mensagem volta para a fila
+    ainda em processamento e outra instância pode pegá-la. Inbox e idempotência impedem o segundo
+    efeito; o custo é trabalho repetido.
+  - Um Postgres fora do ar por mais de ~1 min manda para a DLQ as mensagens que já tinham sido
+    recebidas (5 tentativas). O loop pausa para não gastar tentativas das que ainda não recebeu.
+    Reprocessar da DLQ é seguro.
+  - O status `FAILED` existe no modelo, no schema e no mapeamento HTTP, mas nada o produz ainda: quem
+    desiste é a DLQ, e a key fica livre para reprocessar depois da correção.
+  - O teste com SIGTERM real num processo só roda em Linux/macOS; no Windows ele é pulado (e o README
+    mostra como rodá-lo num container).
 
 ## 13. Decisões da fase 1 (scaffolding)
 
@@ -318,7 +337,7 @@ Interpretações do enunciado e escolhas de modelagem, todas cobertas por testes
    mesmo hash para "sem referência"), amount normalizado (`"25"` e `"25.00"` dão o mesmo hash). Campos
    hasheados: `providerId, externalTransactionId, playerId, walletId, roundId, gameId, kind, money,
    referenceExternalTransactionId`. O `payloadHash` do `InboxMessage` é só uma string; a fase 6 decide o que
-   hashear.
+   hashear (decidido na seção 18.2).
 5. **Tempo e ids vêm de fora.** O domínio não chama `new Date()` nem gera UUID; factories e transições
    recebem `now` e ids por parâmetro (ports `Clock` e `IdGenerator` ficam na `application`).
 6. **Assinaturas ajustadas em relação ao esqueleto do desafio.**
@@ -505,7 +524,109 @@ Interpretações do enunciado e escolhas de modelagem, todas cobertas por testes
    configuração do item 5. Em 10 execuções seguidas, `bun run test:concurrency` passou nas 10
    (12 testes cada; de 12 a 15 s, com um ponto fora da curva de 25 s; a maior parte do tempo é para
    subir processos).
-8. **Fora desta fase:** instância congelada segurando lock (seção 12); SIGTERM gracioso (fase 6; no
-   Windows, `kill` é sempre forçado); itens 5 a 7 da lista de concorrência do desafio (worker morto
-   entre commit e ack, dois publishers, reversão antes da referência), que dependem do consumer e dos
-   workers das fases 6 e 7.
+8. **Fora desta fase:** instância congelada segurando lock (seção 12); SIGTERM gracioso e worker morto
+   entre commit e ack (feitos na fase 6, seção 18); dois publishers e reversão antes da referência
+   (fase 7).
+
+## 18. Decisões da fase 6 (consumer SQS)
+
+1. **O mesmo use case, com a entrega como parâmetro.** `ProcessWagerTransaction.execute(command,
+   delivery?)`, com `delivery = { consumerName, messageId, messageType, receivedAt }`. Na mesma transação
+   SQL:
+   - inbox `(consumerName, messageId)` já existe → reentrega: devolve o resultado original sem efeito
+     (`idempotentReplay: true`, `duplicateDelivery: true`);
+   - senão, o fluxo do HTTP (seção 5) roda e, em **todo desfecho confirmado** (PROCESSED, REJECTED,
+     PENDING_REFERENCE e também replay pela key), a inbox é gravada no mesmo COMMIT;
+   - erro lançado faz rollback e não deixa inbox: a mensagem pode ser tentada de novo;
+   - `pk_inbox_messages` entrou na lista de corrida residual: a mesma mensagem com dois consumers ao
+     mesmo tempo → um confirma, o outro bate na PK, roda de novo uma vez e vira reentrega.
+   - `consumerName` é o nome lógico (`SQS_CONSUMER_NAME`), o mesmo em todas as instâncias. O `messageId`
+     é o do envelope, estável entre reenvios do produtor; o `MessageId` do SQS muda a cada envio e não
+     serve para deduplicar.
+2. **Hash da inbox:** SHA-256 (hex) do JSON canônico de `{ type, idempotencyKey, payloadHash }`, em que
+   `payloadHash` é o da transação (amount normalizado: "25" e "25.00" dão o mesmo). `messageId`,
+   `occurredAt` e metadados do SQS ficam de fora. O mesmo `messageId` com outro conteúdo é
+   `INBOX_MESSAGE_CONFLICT` (conflito → DLQ), nunca uma segunda execução.
+3. **Contrato da mensagem:** envelope da seção 10 do desafio; `data` tem a mesma forma do corpo do
+   `POST /wagering/transactions` (schema compartilhado em `src/interfaces/contracts`), mais a
+   `idempotencyKey`, obrigatória e com as regras do header. `messageId`: até 128 caracteres ASCII
+   visíveis (como o `MessageDeduplicationId`). `correlationId` dos eventos: o do envelope, se vier num
+   formato válido, senão o `messageId`; `causationId` = `messageId`.
+4. **Decisão por mensagem** (`src/interfaces/sqs/consumer-decision.ts`, a partir de `classifyError`):
+
+   | Situação | Decisão |
+   |---|---|
+   | PROCESSED, REJECTED, PENDING_REFERENCE, replay, reentrega | ack depois do COMMIT |
+   | JSON inválido, tipo desconhecido, envelope ou campo inválido (`validation`) | DLQ na hora |
+   | `IDEMPOTENCY_CONFLICT`, `EXTERNAL_TRANSACTION_CONFLICT`, `INBOX_MESSAGE_CONFLICT` | DLQ na hora |
+   | `WALLET_NOT_FOUND` | DLQ na hora |
+   | `LOCK_TIMEOUT`, `LOCK_CONFLICT`, `DATABASE_UNAVAILABLE`, `CONCURRENT_CONFLICT` | retry com backoff |
+   | erro interno ou desconhecido | retry com backoff (o redrive limita) |
+   | erro de negócio lançado (o caminho normal devolve REJECTED) | ack |
+
+   Conflitos e wallet inexistente vão direto para a DLQ: nada auditável pode ser gravado (a FK barra
+   transação sem wallet), repetir não muda o resultado e, pela fila, não há resposta para o provedor
+   ler, então um ack com log perderia a informação. Erro interno não é "permanente" por definição: pode
+   ser uma falha passageira não mapeada; repete e, se persistir, o redrive leva à DLQ.
+5. **Backoff pela contagem do SQS:** `min(base × 2^(n−1), máximo)` com n = `ApproximateReceiveCount`
+   (padrão 2s e 60s, sem jitter, como o da outbox). A contagem é do SQS, não da memória do processo:
+   vale para qualquer instância e sobrevive a reinícios. Com `maxReceiveCount = 5`, a mensagem tenta por
+   cerca de 1 min (2 + 4 + 8 + 16 + 32 s) antes da DLQ. Se o SQS ou o banco estiverem fora do ar, o
+   loop pausa (500 ms dobrando até 30 s) antes de buscar mais, para não gastar tentativas das mensagens
+   que ainda não recebeu.
+6. **DLQ na hora** = `SendMessage` para a DLQ (corpo intacto, mesmo grupo, atributos `failure-kind`,
+   `failure-code`, `source-message-id`, `receive-count`) e depois `DeleteMessage`. Não é atômico: se o
+   processo morrer entre os dois, a reentrega cai no mesmo erro e envia de novo com o mesmo
+   `MessageDeduplicationId` (o `MessageId` do SQS, que não muda entre reentregas), e a dedup do FIFO
+   descarta a cópia. O redrive nativo (tentativas esgotadas) não traz motivo; o log `message will be
+   retried` tem o código do erro de cada tentativa. Para reprocessar da DLQ, reenviar o corpo com
+   **outro** dedup id (a janela de 5 min do FIFO descartaria o mesmo): a inbox impede o efeito duplo.
+7. **Ordem.** No mesmo lote, grupos rodam em paralelo e as mensagens de um grupo em sequência. Achado
+   no LocalStack 3.8: devolver com visibilidade 0 a 2ª mensagem de um grupo enquanto a 1ª está em
+   backoff faz a 2ª ser entregue antes. Por isso, quando uma mensagem vai para retry, as seguintes do
+   mesmo grupo no lote voltam com o mesmo atraso. A ordem continua sendo otimização: fora de ordem, uma
+   reversão vira PENDING_REFERENCE e a correção não muda.
+8. **Shutdown.** `beforeApplicationShutdown` (antes de o ORM e o cliente SQS fecharem): não busca mais,
+   termina a mensagem em andamento de cada grupo e devolve as que não começaram com visibilidade 0.
+   **O long poll em andamento não é cancelado.** Achado nos testes: cancelado do lado do cliente, o
+   LocalStack mantém a requisição aberta e entrega mensagens a ela; elas ficam invisíveis até o fim da
+   visibilidade sem ninguém processar. O consumer espera o long poll terminar sozinho (por isso
+   `SQS_WAIT_TIME_SECONDS` caiu para 10s) e devolve na hora o que ele trouxer. Prazo total
+   `SQS_SHUTDOWN_TIMEOUT_MS` (15s); estourado, cancela o long poll e devolve também as em andamento (se
+   uma delas ainda confirmar, a reentrega cai na inbox). `stop_grace_period: 30s` no compose.
+9. **`FAILED` não é produzido nesta fase:** a DLQ é o registro da desistência, e a key fica livre para
+   reprocessar depois que a causa for corrigida (FAILED seria terminal).
+10. **Portas e adapters.** `WagerQueue` (receive, ack, retryAfter, deadLetter) é definida em
+    `src/interfaces/sqs` e implementada por `SqsWagerQueue` (`src/infrastructure/messaging`), sobre um
+    `SQSClient` por processo (`MessagingModule`, reaproveitado pelo publisher da fase 7). Com
+    `SQS_ENDPOINT` definido, o SDK fala sempre com esse endpoint (não com o host da QueueUrl). O loop
+    (`WagerMessageConsumer`) é uma classe pura, testada em unidade com uma fila em memória.
+11. **Configuração nova:** `SQS_CONSUMER_NAME`, `SQS_WAIT_TIME_SECONDS` (10), `SQS_MAX_MESSAGES` (10),
+    `SQS_VISIBILITY_TIMEOUT_S` (30), `SQS_RETRY_BASE_DELAY_S` (2), `SQS_RETRY_MAX_DELAY_S` (60),
+    `SQS_SHUTDOWN_TIMEOUT_MS` (15000).
+12. **Testes** (LocalStack e Postgres reais; todos terminam com `expectConsistentWallets`):
+    - Cada arquivo cria as **próprias filas** (FIFO + DLQ com redrive 5, como o `init-queues.sh`):
+      os testes não disputam mensagens entre si nem com o container `app` (`ROLE=all`). Pelo mesmo
+      motivo, o teste de health (`ROLE=all`) agora usa filas próprias.
+    - Um **proxy HTTP** na frente do LocalStack (`test/support/sqs-proxy.ts`) registra cada chamada
+      (backoff de cada `ChangeMessageVisibility`, cada ack, cada recebimento com a contagem) e pode
+      segurar uma operação. É assim que o teste mata o consumer depois do COMMIT e antes do ack, sem
+      gancho de teste no código de produção.
+    - `test/integration/sqs/inbox.test.ts`: atomicidade (falha injetada no COMMIT com transação, saldo,
+      ledger, outbox e inbox escritos → nada fica), reentrega, `messageId` reutilizado, outra mensagem
+      com a mesma key, inbox em REJECTED/PENDING_REFERENCE, rollback sem inbox e a mesma entrega em
+      paralelo.
+    - `consumer.test.ts`: ack depois do COMMIT com correlação nos eventos, REJECTED/PENDING_REFERENCE,
+      HTTP e depois fila, reentrega fora da dedup do FIFO e duas instâncias com a mesma mensagem ao
+      mesmo tempo (sincronizadas pelo lock da wallet).
+    - `retry-and-dlq.test.ts`: backoff 1s, 2s, 4s observado; esgotamento → redrive nativo para a DLQ
+      sem nada gravado e reprocessamento a partir da DLQ; oito tipos de erro permanente direto na DLQ
+      com o motivo; INSUFFICIENT_FUNDS com ack.
+    - `shutdown.test.ts`: `app.close()` (o caminho do SIGTERM) com uma mensagem parada no lock e outras
+      atrás. O teste com SIGTERM real num processo é pulado no Windows; rodou e passou num container
+      Linux (comando no README).
+    - `test/concurrency/consumer-crash.test.ts`: consumer morto (SIGKILL) depois do COMMIT e antes do
+      ack, outro processo recebe a reentrega (contagem 2) e não repete o efeito; três consumers em
+      processos com 72 mensagens (duplicadas e reenviadas com outro `messageId`) → cada operação
+      aplicada uma vez.
+    - Os testes novos de SQS passaram 5 vezes seguidas (cerca de 34 s por execução).

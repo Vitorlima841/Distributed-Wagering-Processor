@@ -41,6 +41,9 @@ services:
       AWS_ACCESS_KEY_ID: test
       AWS_SECRET_ACCESS_KEY: test
       SQS_ENDPOINT: http://localstack:4566
+    # SIGTERM: o consumer termina o que está em andamento (até SQS_SHUTDOWN_TIMEOUT_MS = 15s)
+    # antes do SIGKILL; o padrão do compose (10s) seria curto
+    stop_grace_period: 30s
     ports:
       - "3000:3000"
     depends_on:

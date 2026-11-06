@@ -95,14 +95,17 @@ Enunciado: `docs/CHALLENGE.md` · Regras: `CLAUDE.md` · Decisões: `ARCHITECTUR
       as instâncias no meio de uma carga; checagem final também da sequência do ledger e da outbox
       (ver ARCHITECTURE §17)
 
-### Fase 6 — Consumer SQS ⚠️
-- [ ] Consumer com long polling, chamando o mesmo use case
-- [ ] Inbox `(consumerName, messageId)` na mesma transação
-- [ ] Ack só após commit
-- [ ] Classificação de erros: negócio (ack), transitório (visibilidade + backoff), permanente (DLQ)
-- [ ] Redrive para DLQ após `maxReceiveCount`
-- [ ] Graceful shutdown no SIGTERM
-- [ ] Testes: redelivery, worker morto depois do commit e antes do ack, retry, DLQ
+### Fase 6 — Consumer SQS ⚠️ ✅
+- [x] Consumer com long polling, chamando o mesmo use case
+- [x] Inbox `(consumerName, messageId)` na mesma transação
+- [x] Ack só após commit
+- [x] Classificação de erros: negócio (ack), transitório (visibilidade + backoff), permanente (DLQ)
+- [x] Redrive para DLQ após `maxReceiveCount`
+- [x] Graceful shutdown no SIGTERM
+- [x] Testes: redelivery, worker morto depois do commit e antes do ack, retry, DLQ
+- [x] Extra: atomicidade da inbox com falha no COMMIT, duas instâncias com a mesma mensagem, 3 consumers
+      em processos com duplicatas, shutdown sem cancelar o long poll (achado no LocalStack), filas
+      próprias por arquivo de teste e proxy do SQS para observar/segurar chamadas (ver ARCHITECTURE §18)
 
 ### Fase 7 — Outbox + PENDING_REFERENCE ⚠️
 - [ ] Publisher com `FOR UPDATE SKIP LOCKED`, backoff e `markPublished`

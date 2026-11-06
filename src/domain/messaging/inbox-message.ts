@@ -1,5 +1,6 @@
-import { InvalidFieldError, InvalidMessageStateError } from '../errors';
+import { InboxMessageConflictError, InvalidFieldError, InvalidMessageStateError } from '../errors';
 import { assertNonEmpty } from '../shared/assert';
+import { canonicalJson, sha256Hex } from '../wager/payload-hash';
 
 export interface ReceiveInboxProps {
   messageId: string;
@@ -10,6 +11,30 @@ export interface ReceiveInboxProps {
 
 export interface InboxMessageState extends ReceiveInboxProps {
   processedAt?: Date | undefined;
+}
+
+/** O que identifica o conteúdo de uma mensagem de transação, independente do transporte. */
+export interface InboxPayloadInput {
+  /** `type` do envelope (ex.: `WagerTransactionRequested`). */
+  messageType: string;
+  idempotencyKey: string;
+  /** `payloadHash` da transação (JSON canônico dos campos de negócio, amount normalizado). */
+  wagerPayloadHash: string;
+}
+
+/**
+ * Hash do conteúdo da mensagem gravado na inbox: SHA-256 (hex) do JSON canônico de
+ * `{ type, idempotencyKey, payloadHash }`. Reaproveita o hash da transação, então "25" e "25.00"
+ * dão o mesmo resultado; o `messageId`, o `occurredAt` e os metadados do SQS ficam de fora.
+ */
+export function computeInboxPayloadHash(input: InboxPayloadInput): string {
+  return sha256Hex(
+    canonicalJson({
+      type: input.messageType,
+      idempotencyKey: input.idempotencyKey,
+      payloadHash: input.wagerPayloadHash,
+    }),
+  );
 }
 
 /** Registro de dedup por `(consumerName, messageId)`, gravado na mesma transação SQL do efeito. */
@@ -60,5 +85,15 @@ export class InboxMessage {
       throw new InvalidMessageStateError(`Mensagem ${this.messageId} já foi processada`);
     }
     this._processedAt = at;
+  }
+
+  /**
+   * Reentrega legítima traz o mesmo conteúdo. Conteúdo diferente com o mesmo id é conflito
+   * (`InboxMessageConflictError`), nunca uma segunda execução.
+   */
+  assertRedeliveryOf(payloadHash: string): void {
+    if (this.payloadHash !== payloadHash) {
+      throw new InboxMessageConflictError(this.consumerName, this.messageId);
+    }
   }
 }

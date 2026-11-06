@@ -1,6 +1,8 @@
 import {
   type CreateWagerTransactionProps,
+  computeInboxPayloadHash,
   INTERNAL_PROVIDER_ID,
+  InboxMessage,
   InvalidFieldError,
   InvalidTransactionKindError,
   Money,
@@ -38,6 +40,20 @@ export interface ProcessWagerTransactionCommand {
   causationId?: string | undefined;
 }
 
+/**
+ * Entrega vinda de uma fila. Com ela, o use case consulta e grava a inbox
+ * `(consumerName, messageId)` na mesma transação SQL do efeito (ARCHITECTURE §9).
+ */
+export interface MessageDelivery {
+  /** Consumidor lógico: o mesmo em todas as instâncias (não identifica o processo). */
+  consumerName: string;
+  /** Id do envelope, estável entre reenvios do produtor (não o MessageId do SQS). */
+  messageId: string;
+  /** `type` do envelope; entra no hash do conteúdo da mensagem. */
+  messageType: string;
+  receivedAt: Date;
+}
+
 /** Uma tentativa extra cobre a corrida residual; uma segunda colisão seguida não é corrida. */
 const MAX_ATTEMPTS = 2;
 
@@ -46,6 +62,8 @@ const RESIDUAL_RACE_CONSTRAINTS: ReadonlySet<string> = new Set([
   UniqueConstraint.IdempotencyKey,
   UniqueConstraint.ProviderExternalId,
   UniqueConstraint.ReversalOnce,
+  // a mesma mensagem processada por dois consumers ao mesmo tempo: a segunda vira reentrega
+  UniqueConstraint.InboxMessage,
 ]);
 
 /**
@@ -59,6 +77,11 @@ const RESIDUAL_RACE_CONSTRAINTS: ReadonlySet<string> = new Set([
  *  5. referência + regra de negócio no domínio; transação, saldo, ledger e outbox gravados juntos
  * Uma violação de unicidade no COMMIT (corrida entre wallets diferentes com a mesma key) desfaz
  * tudo e o fluxo roda de novo uma vez, respondendo replay ou conflito.
+ *
+ * Com `delivery` (consumer SQS), antes de tudo a inbox: mensagem já registrada → devolve o
+ * resultado original sem efeito (`duplicateDelivery`); senão o fluxo acima roda e, em todo
+ * desfecho confirmado (inclusive replay), a inbox é gravada no mesmo COMMIT. Erro lançado faz
+ * rollback e não deixa inbox: a mensagem pode ser tentada de novo.
  */
 export class ProcessWagerTransaction {
   constructor(
@@ -67,7 +90,10 @@ export class ProcessWagerTransaction {
     private readonly ids: IdGenerator,
   ) {}
 
-  async execute(command: ProcessWagerTransactionCommand): Promise<WagerTransactionOutcome> {
+  async execute(
+    command: ProcessWagerTransactionCommand,
+    delivery?: MessageDelivery,
+  ): Promise<WagerTransactionOutcome> {
     const props = parseCommand(command);
     const build = () =>
       WagerTransaction.create({ ...props, id: this.ids.newId(), now: this.clock.now() });
@@ -75,7 +101,11 @@ export class ProcessWagerTransaction {
     let candidate = build();
     for (let attempt = 1; ; attempt += 1) {
       try {
-        return await this.uow.run((scope) => this.process(scope, candidate, command));
+        return await this.uow.run((scope) =>
+          delivery
+            ? this.processDelivery(scope, candidate, command, delivery)
+            : this.process(scope, candidate, command),
+        );
       } catch (error) {
         if (attempt >= MAX_ATTEMPTS || !isResidualRace(error)) {
           throw error;
@@ -84,6 +114,42 @@ export class ProcessWagerTransaction {
         candidate = build();
       }
     }
+  }
+
+  private async processDelivery(
+    scope: TransactionScope,
+    candidate: WagerTransaction,
+    command: ProcessWagerTransactionCommand,
+    delivery: MessageDelivery,
+  ): Promise<WagerTransactionOutcome> {
+    const contentHash = computeInboxPayloadHash({
+      messageType: delivery.messageType,
+      idempotencyKey: candidate.idempotencyKey,
+      wagerPayloadHash: candidate.payloadHash,
+    });
+    const seen = await scope.inbox.find(delivery.consumerName, delivery.messageId);
+    if (seen) {
+      seen.assertRedeliveryOf(contentHash);
+      // inbox e transação são gravadas no mesmo COMMIT, e transação não é apagada
+      const original = await scope.transactions.findByIdempotencyKey(candidate.idempotencyKey);
+      if (!original) {
+        throw new Error(
+          `Inbox ${delivery.consumerName}/${delivery.messageId} sem a transação correspondente`,
+        );
+      }
+      return { ...replay(original, candidate), duplicateDelivery: true };
+    }
+
+    const outcome = await this.process(scope, candidate, command);
+    const inbox = InboxMessage.receive({
+      consumerName: delivery.consumerName,
+      messageId: delivery.messageId,
+      payloadHash: contentHash,
+      receivedAt: delivery.receivedAt,
+    });
+    inbox.markProcessed(this.clock.now());
+    await scope.inbox.add(inbox);
+    return outcome;
   }
 
   private async process(

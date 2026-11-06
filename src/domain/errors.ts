@@ -77,6 +77,18 @@ export class IdempotencyConflictError extends DomainError {
   }
 }
 
+/**
+ * O mesmo `(consumerName, messageId)` chegou com outro conteúdo: o produtor reutilizou o id de
+ * uma mensagem. Não é reentrega (que traria o mesmo conteúdo) nem pode ser processada.
+ */
+export class InboxMessageConflictError extends DomainError {
+  readonly code = 'INBOX_MESSAGE_CONFLICT';
+  readonly category = 'conflict';
+  constructor(consumerName: string, messageId: string) {
+    super(`Mensagem "${messageId}" já recebida por ${consumerName} com outro conteúdo`);
+  }
+}
+
 export class CurrencyMismatchError extends DomainError {
   readonly code = 'CURRENCY_MISMATCH';
   readonly category = 'invariant';

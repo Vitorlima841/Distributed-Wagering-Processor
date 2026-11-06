@@ -10,9 +10,9 @@ import {
   classifyError,
   ID_GENERATOR,
   type IdGenerator,
-  PersistenceError,
 } from '../../application';
 import { LOGGER, type Logger } from '../../infrastructure/logging/logger';
+import { safeErrorFields } from '../../infrastructure/logging/safe-error-fields';
 import { CORRELATION_HEADER, correlationIdOf } from './correlation';
 import { HTTP_STATUS_BY_ERROR_KIND, TRANSIENT_RETRY_AFTER_SECONDS } from './http-status';
 import type { HttpRequest, HttpResponse } from './http-types';
@@ -131,22 +131,4 @@ function categoryOf(classified: ClassifiedError): string {
   return classified.kind === 'invariant' || classified.kind === 'unknown'
     ? 'internal'
     : classified.kind;
-}
-
-/**
- * Campos de log seguros. Mensagens de erro do banco/driver trazem o SQL com os parâmetros
- * (valores financeiros, ids de player): ficam de fora; sobram nome, SQLSTATE e constraint.
- */
-function safeErrorFields(error: unknown): Record<string, unknown> {
-  if (!(error instanceof Error)) {
-    return { errorType: typeof error };
-  }
-  const { code, constraint } = error as { code?: unknown; constraint?: unknown };
-  const fromDatabase = error instanceof PersistenceError || typeof code === 'string';
-  return {
-    errorName: error.name,
-    ...(typeof code === 'string' ? { errorCode: code } : {}),
-    ...(typeof constraint === 'string' ? { constraint } : {}),
-    ...(fromDatabase ? {} : { errorMessage: error.message, stack: error.stack }),
-  };
 }

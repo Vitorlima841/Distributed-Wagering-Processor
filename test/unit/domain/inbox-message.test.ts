@@ -1,6 +1,10 @@
 import { describe, expect, test } from 'bun:test';
-import { InvalidFieldError, InvalidMessageStateError } from '../../../src/domain/errors';
-import { InboxMessage } from '../../../src/domain/messaging/inbox-message';
+import {
+  InboxMessageConflictError,
+  InvalidFieldError,
+  InvalidMessageStateError,
+} from '../../../src/domain/errors';
+import { computeInboxPayloadHash, InboxMessage } from '../../../src/domain/messaging/inbox-message';
 import { at, T0 } from './builders';
 
 const hash = 'a'.repeat(64);
@@ -62,5 +66,39 @@ describe('InboxMessage', () => {
     });
     expect(msg.isProcessed()).toBe(true);
     expect(() => msg.markProcessed(at(2))).toThrow(InvalidMessageStateError);
+  });
+
+  test('reentrega com o mesmo conteúdo passa; outro conteúdo com o mesmo id é conflito', () => {
+    const msg = InboxMessage.receive({
+      messageId: 'msg-123',
+      consumerName: 'wager-consumer',
+      payloadHash: hash,
+      receivedAt: T0,
+    });
+    expect(() => msg.assertRedeliveryOf(hash)).not.toThrow();
+    expect(() => msg.assertRedeliveryOf('b'.repeat(64))).toThrow(InboxMessageConflictError);
+  });
+});
+
+describe('computeInboxPayloadHash', () => {
+  const input = {
+    messageType: 'WagerTransactionRequested',
+    idempotencyKey: 'provider-a:tx-1',
+    wagerPayloadHash: 'c'.repeat(64),
+  };
+
+  test('SHA-256 hex, determinístico', () => {
+    const value = computeInboxPayloadHash(input);
+    expect(value).toMatch(/^[0-9a-f]{64}$/);
+    expect(computeInboxPayloadHash({ ...input })).toBe(value);
+  });
+
+  test('muda com o tipo, a key ou o conteúdo da transação', () => {
+    const value = computeInboxPayloadHash(input);
+    expect(computeInboxPayloadHash({ ...input, messageType: 'Other' })).not.toBe(value);
+    expect(computeInboxPayloadHash({ ...input, idempotencyKey: 'provider-a:tx-2' })).not.toBe(
+      value,
+    );
+    expect(computeInboxPayloadHash({ ...input, wagerPayloadHash: 'd'.repeat(64) })).not.toBe(value);
   });
 });

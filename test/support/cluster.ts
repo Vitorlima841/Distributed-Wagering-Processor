@@ -132,6 +132,31 @@ export class AppInstance implements HttpTarget {
     await this.proc.exited;
   }
 
+  /**
+   * SIGTERM: desligamento gracioso (os hooks do Nest rodam). Só em Linux/macOS: no Windows o Bun
+   * encerra o processo à força, como o `kill()`.
+   */
+  async terminate(): Promise<void> {
+    if (this.alive) {
+      this.proc.kill('SIGTERM');
+    }
+    await this.proc.exited;
+  }
+
+  /** Linhas de log JSON já lidas do processo (as que não são JSON ficam de fora). */
+  jsonLogs(): Record<string, unknown>[] {
+    return this.logs.flatMap((line) => {
+      if (!line.startsWith('{')) {
+        return [];
+      }
+      try {
+        return [JSON.parse(line) as Record<string, unknown>];
+      } catch {
+        return [];
+      }
+    });
+  }
+
   recentLogs(): string {
     return this.logs.join('\n');
   }

@@ -6,8 +6,9 @@ provedores. NestJS + Bun + TypeScript estrito + MikroORM + PostgreSQL + SQS (Loc
 Enunciado: [docs/CHALLENGE.md](docs/CHALLENGE.md) · Plano: [docs/PLAN.md](docs/PLAN.md) ·
 Decisões: [ARCHITECTURE.md](ARCHITECTURE.md)
 
-> Estado atual: **fase 5** (domínio, persistência, use cases, API HTTP e suíte de concorrência).
-> Consumer SQS, outbox publisher e worker de PENDING_REFERENCE ainda são casca (fases 6 e 7).
+> Estado atual: **fase 6** (domínio, persistência, use cases, API HTTP, suíte de concorrência e
+> consumer SQS com inbox, retry/DLQ e shutdown gracioso). Outbox publisher e worker de
+> PENDING_REFERENCE ainda são casca (fase 7).
 
 ## Requisitos
 
@@ -42,11 +43,27 @@ bun run dev
 ## Papéis (`ROLE`)
 
 `api` · `consumer` · `outbox` · `pending-ref` · `all` (padrão). Todo processo expõe HTTP
-(`/health/live`). Consumer, outbox e pending-ref são apenas casca nesta fase.
+(`/health/live`). Outbox e pending-ref são apenas casca nesta fase.
 
 ```bash
 ROLE=api docker compose up -d app
 ```
+
+### Consumer SQS
+
+O papel `consumer` (incluído em `all`) lê `wager-transactions.fifo` e chama o mesmo use case do
+`POST /wagering/transactions`. Mensagem (seção 10 do desafio; `data` é o corpo do POST mais a
+`idempotencyKey`, obrigatória):
+
+```bash
+docker compose exec localstack awslocal sqs send-message   --queue-url http://localhost:4566/000000000000/wager-transactions.fifo   --message-group-id <walletId> --message-deduplication-id msg-123   --message-body '{"messageId":"msg-123","type":"WagerTransactionRequested","occurredAt":"2026-07-29T15:00:00.000Z","data":{"providerId":"provider-a","externalTransactionId":"transaction-123","idempotencyKey":"provider-a:transaction-123","playerId":"<playerId>","walletId":"<walletId>","roundId":"round-987","gameId":"fortune-chimp","kind":"BET","money":{"amount":"25.00","currency":"BRL"}}}'
+```
+
+Resultado de negócio (inclusive REJECTED e PENDING_REFERENCE) → ack; falha transitória → volta com
+backoff (2s, 4s, 8s… até 60s) e, depois de 5 recebimentos, o SQS move para
+`wager-transactions-dlq.fifo`; mensagem inválida, conflito ou wallet inexistente → DLQ na hora, com
+o motivo nos atributos `failure-kind` / `failure-code`. Detalhes em
+[ARCHITECTURE.md §9 e §18](ARCHITECTURE.md).
 
 ## Configuração (variáveis de ambiente)
 
@@ -57,9 +74,9 @@ Veja [.env.example](.env.example).
 
 | Comando | O que faz |
 |---|---|
-| `bun test` | todos os testes (os de integração exigem `docker compose up -d postgres localstack`) |
+| `bun test` | todos os testes (integração e concorrência exigem `docker compose up -d postgres localstack`) |
 | `bun run test:unit` | testes unitários (sem infraestrutura) |
-| `bun run test:integration` | integração contra Postgres/LocalStack reais |
+| `bun run test:integration` | integração contra Postgres/LocalStack reais (inclui `test/integration/sqs`) |
 | `bun run test:concurrency` | concorrência: sobe 3 instâncias reais da aplicação (processos separados) contra o Postgres |
 | `bun run typecheck` | `tsc --noEmit` |
 | `bun run lint` / `lint:fix` | Biome |
@@ -80,14 +97,32 @@ o cenário obrigatório (100.00 e duas BET de 80.00), hot wallet, wallets distin
 queda de instâncias (kill sem aviso) e reinício completo. Detalhes em
 [ARCHITECTURE.md §4 e §17](ARCHITECTURE.md). Precisam só de `docker compose up -d postgres localstack`.
 
+`consumer-crash.test.ts` sobe consumers como processos (`ROLE=consumer`): um é morto depois do
+COMMIT e antes do ack (um proxy na frente do LocalStack segura o `DeleteMessage`) e outro recebe a
+reentrega sem repetir o efeito; três consumers processam juntos uma carga com mensagens duplicadas.
+
+### Testes do consumer SQS
+
+`test/integration/sqs` usa o LocalStack real com **filas próprias por arquivo** (criadas e apagadas
+pelo teste), para não disputar mensagens com o container `app`. Cobrem inbox e atomicidade, reentrega,
+duas instâncias com a mesma mensagem, backoff, redrive para a DLQ após 5 recebimentos, erros
+permanentes e shutdown gracioso. O teste com SIGTERM real num processo só roda em Linux/macOS (no
+Windows `kill` encerra à força); para rodá-lo no Windows, use um container:
+
+```bash
+docker run --rm --network distributed-wagering-processor_default -v "$PWD:/app:ro" -v /app/node_modules -e DATABASE_URL=postgres://wagering:wagering@postgres:5432/wagering_test -e SQS_ENDPOINT=http://localstack:4566 -e AWS_ACCESS_KEY_ID=test -e AWS_SECRET_ACCESS_KEY=test distributed-wagering-processor-app bun test test/integration/sqs/shutdown.test.ts
+```
+
+(usa a imagem do `app`, que já tem as dependências instaladas para Linux).
+
 ## Estrutura
 
 ```
 src/
   domain/          # TS puro (sem NestJS/MikroORM/AWS)
   application/     # use cases + ports
-  infrastructure/  # config, MikroORM (records, mappers, repositórios, UnitOfWork), logger, (SQS, outbox...)
-  interfaces/      # HTTP, consumer SQS, workers
+  infrastructure/  # config, MikroORM (records, mappers, repositórios, UnitOfWork), logger, cliente SQS
+  interfaces/      # HTTP, consumer SQS (interfaces/sqs), contratos compartilhados, workers
 migrations/        # reversíveis (up/down), registradas em mikro-orm.config.ts
 test/{unit,integration,concurrency}
 docker/localstack/ # init das filas
