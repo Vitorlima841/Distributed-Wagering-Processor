@@ -225,3 +225,21 @@ token bate com o do payload).
 ## 12. Limitações e trade-offs conhecidos
 
 *(preencher ao longo das fases)*
+
+## 13. Decisões da fase 1 (scaffolding)
+
+- **Versões instaladas**: NestJS 12, MikroORM 7, TypeScript 7, Bun 1.4. Todas são ESM.
+- **Bun × decorators**: o Bun não garante `emitDecoratorMetadata`; toda DI usa `@Inject(Token)` explícito.
+  Funcionou nos testes de integração (grafo Nest completo sobe e responde HTTP).
+- **MikroORM**: `Migrator` como extensão, executado por `scripts/migrate.ts` (sem a CLI) e com
+  `migrationsList` explícita, para não depender de glob de arquivos sob Bun. `EntitySchema` na fase 3.
+  Não usamos `@mikro-orm/nestjs`: o provider de `MikroORM` é próprio (`DatabaseModule`).
+- **Config**: `zod` valida o ambiente em `parseConfig`; falha na inicialização listando os campos inválidos.
+- **Todos os papéis expõem HTTP** (health, futuramente `/metrics`), inclusive consumer/outbox/pending-ref.
+  Isso mantém o processo vivo e permite liveness/readiness por papel.
+- **Lint**: Biome.
+- **LocalStack**: imagem fixada em `3.8` (comunitária, sem `LOCALSTACK_AUTH_TOKEN`). As filas são criadas por
+  `docker/localstack/init-queues.sh`; o healthcheck só passa depois da última fila (`wagering-events`).
+  `wager-transactions.fifo` tem redrive para a DLQ com `maxReceiveCount=5` e `ContentBasedDeduplication=false`.
+- **Porta do Postgres no host**: 5433 (a 5432 costuma estar ocupada por um Postgres local). Dentro da rede do
+  compose continua 5432.
