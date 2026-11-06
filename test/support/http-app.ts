@@ -6,17 +6,21 @@ import { AppModule } from '../../src/app.module';
 import { parseConfig } from '../../src/infrastructure/config/app-config';
 import { ensureTestDatabase } from './database';
 
+/** Qualquer alvo HTTP dos testes: o app em processo ou uma instância em outro processo. */
+export interface HttpTarget {
+  baseUrl: string;
+  request(method: string, path: string, options?: RequestOptions): Promise<TestResponse>;
+}
+
 /**
  * App Nest real (grafo completo, papel `api`) numa porta aleatória, contra o Postgres do docker
  * compose (banco `wagering_test`). Os testes falam HTTP de verdade com ele.
  */
-export interface TestApp {
-  baseUrl: string;
+export interface TestApp extends HttpTarget {
   orm: MikroORM;
   /** Instância do container do Nest (use cases reais, para testes que chamam a application). */
   get<T>(token: abstract new (...args: never[]) => T): T;
   close(): Promise<void>;
-  request(method: string, path: string, options?: RequestOptions): Promise<TestResponse>;
 }
 
 export interface RequestOptions {
@@ -42,31 +46,33 @@ export async function startTestApp(env: Record<string, string> = {}): Promise<Te
   await app.listen(0);
   const baseUrl = (await app.getUrl()).replace('[::1]', 'localhost');
 
-  const request = async (
-    method: string,
-    path: string,
-    options: RequestOptions = {},
-  ): Promise<TestResponse> => {
-    const hasBody = options.body !== undefined || options.rawBody !== undefined;
-    const res = await fetch(`${baseUrl}${path}`, {
-      method,
-      headers: {
-        ...(hasBody ? { 'content-type': 'application/json' } : {}),
-        ...options.headers,
-      },
-      ...(hasBody ? { body: options.rawBody ?? JSON.stringify(options.body) } : {}),
-    });
-    const text = await res.text();
-    return { status: res.status, headers: res.headers, body: text ? JSON.parse(text) : undefined };
-  };
-
   return {
     baseUrl,
     orm: app.get(MikroORM),
     get: <T>(token: abstract new (...args: never[]) => T): T => app.get<T>(token as never),
     close: () => app.close(),
-    request,
+    request: (method, path, options) => httpRequest(baseUrl, method, path, options),
   };
+}
+
+/** Requisição HTTP real; o corpo da resposta vem parseado como JSON (ou undefined se vazio). */
+export async function httpRequest(
+  baseUrl: string,
+  method: string,
+  path: string,
+  options: RequestOptions = {},
+): Promise<TestResponse> {
+  const hasBody = options.body !== undefined || options.rawBody !== undefined;
+  const res = await fetch(`${baseUrl}${path}`, {
+    method,
+    headers: {
+      ...(hasBody ? { 'content-type': 'application/json' } : {}),
+      ...options.headers,
+    },
+    ...(hasBody ? { body: options.rawBody ?? JSON.stringify(options.body) } : {}),
+  });
+  const text = await res.text();
+  return { status: res.status, headers: res.headers, body: text ? JSON.parse(text) : undefined };
 }
 
 /** Atalhos da API usados por vários arquivos de teste. Dinheiro sempre como string. */
@@ -77,7 +83,7 @@ export interface CreatedWallet {
 }
 
 export async function createWallet(
-  app: TestApp,
+  app: HttpTarget,
   initial: string,
   { currency = 'BRL', playerId = randomUUID() }: { currency?: string; playerId?: string } = {},
 ): Promise<CreatedWallet> {
@@ -121,7 +127,7 @@ export function wagerBody(wallet: CreatedWallet, input: WagerRequest): Record<st
 
 /** Submete uma transação; a key padrão é `{providerId}:{externalTransactionId}`. */
 export function submitWager(
-  app: TestApp,
+  app: HttpTarget,
   wallet: CreatedWallet,
   input: WagerRequest,
 ): Promise<TestResponse & { externalTransactionId: string }> {
@@ -134,7 +140,7 @@ export function submitWager(
 }
 
 export function submitRaw(
-  app: TestApp,
+  app: HttpTarget,
   body: unknown,
   idempotencyKey: string | undefined,
   correlationId?: string,

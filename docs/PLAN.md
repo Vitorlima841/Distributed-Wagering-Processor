@@ -84,13 +84,16 @@ Enunciado: `docs/CHALLENGE.md` · Regras: `CLAUDE.md` · Decisões: `ARCHITECTUR
 - [x] Extra: corridas determinísticas de idempotência (espera no lock, colisão no índice único) e
       503 por `lock_timeout`, ver ARCHITECTURE §16
 
-### Fase 5 — Concorrência ⚠️
-- [ ] Mesma aposta 50x em paralelo → um único débito
-- [ ] Cenário obrigatório: 100.00, duas BET de 80.00 → uma PROCESSED, uma REJECTED, saldo 20.00, 1 débito
-- [ ] Wallets distintas em paralelo (sem serialização entre elas)
-- [ ] ≥ 3 processos/instâncias simultâneos (processos reais, por exemplo `Bun.spawn` ou réplicas do compose)
-- [ ] Reinício do serviço com comprovação da consistência final
-- [ ] Todos terminam com `wallet.balance == saldo reconstruído pelo ledger`
+### Fase 5 — Concorrência ⚠️ ✅
+- [x] Mesma aposta 50x em paralelo → um único débito
+- [x] Cenário obrigatório: 100.00, duas BET de 80.00 → uma PROCESSED, uma REJECTED, saldo 20.00, 1 débito
+- [x] Wallets distintas em paralelo (sem serialização entre elas)
+- [x] ≥ 3 processos/instâncias simultâneos (processos reais, por exemplo `Bun.spawn` ou réplicas do compose)
+- [x] Reinício do serviço com comprovação da consistência final
+- [x] Todos terminam com `wallet.balance == saldo reconstruído pelo ledger`
+- [x] Extra: hot wallet com 45 operações misturadas, reversões concorrentes da mesma BET, queda de todas
+      as instâncias no meio de uma carga; checagem final também da sequência do ledger e da outbox
+      (ver ARCHITECTURE §17)
 
 ### Fase 6 — Consumer SQS ⚠️
 - [ ] Consumer com long polling, chamando o mesmo use case

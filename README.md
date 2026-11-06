@@ -6,7 +6,8 @@ provedores. NestJS + Bun + TypeScript estrito + MikroORM + PostgreSQL + SQS (Loc
 Enunciado: [docs/CHALLENGE.md](docs/CHALLENGE.md) · Plano: [docs/PLAN.md](docs/PLAN.md) ·
 Decisões: [ARCHITECTURE.md](ARCHITECTURE.md)
 
-> Estado atual: **fase 1** (scaffolding e infraestrutura). Ainda não há lógica de negócio.
+> Estado atual: **fase 5** (domínio, persistência, use cases, API HTTP e suíte de concorrência).
+> Consumer SQS, outbox publisher e worker de PENDING_REFERENCE ainda são casca (fases 6 e 7).
 
 ## Requisitos
 
@@ -59,7 +60,7 @@ Veja [.env.example](.env.example).
 | `bun test` | todos os testes (os de integração exigem `docker compose up -d postgres localstack`) |
 | `bun run test:unit` | testes unitários (sem infraestrutura) |
 | `bun run test:integration` | integração contra Postgres/LocalStack reais |
-| `bun run test:concurrency` | concorrência (a partir da fase 5) |
+| `bun run test:concurrency` | concorrência: sobe 3 instâncias reais da aplicação (processos separados) contra o Postgres |
 | `bun run typecheck` | `tsc --noEmit` |
 | `bun run lint` / `lint:fix` | Biome |
 | `bun run migration:up` / `migration:down` | aplica / reverte uma migration |
@@ -67,6 +68,17 @@ Veja [.env.example](.env.example).
 Os testes de integração usam o banco `wagering_test` (no mesmo Postgres do compose), criado e migrado
 automaticamente na primeira execução. O ledger é append-only, então os testes não limpam tabelas: cada um
 usa ids novos. Para recomeçar do zero: `docker compose exec postgres dropdb -U wagering wagering_test`.
+
+### Testes de concorrência
+
+`test/concurrency` sobe, por arquivo, **3 processos** `bun src/main.ts` (`ROLE=api`, porta efêmera,
+banco `wagering_test`) e fala HTTP com eles; o único estado compartilhado é o Postgres. Para provar
+que as requisições estavam mesmo em paralelo, o teste trava a wallet numa conexão própria, dispara
+as requisições pelas 3 instâncias e só solta o lock quando o `pg_stat_activity` mostra todas
+esperando por ele (cada instância tem um `application_name` próprio). Cobrem: a mesma aposta 50x,
+o cenário obrigatório (100.00 e duas BET de 80.00), hot wallet, wallets distintas em paralelo,
+queda de instâncias (kill sem aviso) e reinício completo. Detalhes em
+[ARCHITECTURE.md §4 e §17](ARCHITECTURE.md). Precisam só de `docker compose up -d postgres localstack`.
 
 ## Estrutura
 

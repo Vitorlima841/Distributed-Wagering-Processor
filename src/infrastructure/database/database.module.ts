@@ -11,7 +11,13 @@ import { MikroOrmUnitOfWork } from './mikro-orm-unit-of-work';
     {
       provide: MikroORM,
       inject: [APP_CONFIG],
-      useFactory: (config: AppConfig) => MikroORM.init(buildOrmConfig(config.databaseUrl)),
+      useFactory: (config: AppConfig) =>
+        MikroORM.init(
+          buildOrmConfig(config.databaseUrl, {
+            poolMax: config.dbPoolMax,
+            applicationName: config.dbApplicationName,
+          }),
+        ),
     },
     {
       provide: UNIT_OF_WORK,

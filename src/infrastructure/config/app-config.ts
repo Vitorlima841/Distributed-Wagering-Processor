@@ -5,13 +5,19 @@ export type Role = (typeof ROLES)[number];
 
 const schema = z.object({
   ROLE: z.enum(ROLES).default('all'),
-  PORT: z.coerce.number().int().min(1).max(65535).default(3000),
+  // 0 = porta efêmera escolhida pelo SO (o log de inicialização informa a porta real)
+  PORT: z.coerce.number().int().min(0).max(65535).default(3000),
   LOG_LEVEL: z.enum(['fatal', 'error', 'warn', 'info', 'debug', 'trace', 'silent']).default('info'),
   DATABASE_URL: z
     .string()
     .min(1)
     .refine((v) => /^postgres(ql)?:\/\//.test(v), 'DATABASE_URL deve começar com postgres://'),
   DB_LOCK_TIMEOUT_MS: z.coerce.number().int().min(1).default(5000),
+  DB_POOL_MAX: z.coerce.number().int().min(1).max(200).default(10),
+  DB_APPLICATION_NAME: z
+    .string()
+    .regex(/^[A-Za-z0-9._-]{1,63}$/, 'use até 63 caracteres [A-Za-z0-9._-]')
+    .optional(),
   AWS_REGION: z.string().min(1).default('us-east-1'),
   AWS_ACCESS_KEY_ID: z.string().min(1),
   AWS_SECRET_ACCESS_KEY: z.string().min(1),
@@ -28,6 +34,10 @@ export interface AppConfig {
   databaseUrl: string;
   /** Espera máxima por um lock de linha (ex.: wallet disputada) antes de falhar como transitório. */
   dbLockTimeoutMs: number;
+  /** Máximo de conexões do pool deste processo. */
+  dbPoolMax: number;
+  /** `application_name` das conexões: identifica o processo no `pg_stat_activity` (quem trava o quê). */
+  dbApplicationName: string;
   aws: {
     region: string;
     accessKeyId: string;
@@ -55,6 +65,8 @@ export function parseConfig(env: Record<string, string | undefined>): AppConfig 
     logLevel: e.LOG_LEVEL,
     databaseUrl: e.DATABASE_URL,
     dbLockTimeoutMs: e.DB_LOCK_TIMEOUT_MS,
+    dbPoolMax: e.DB_POOL_MAX,
+    dbApplicationName: e.DB_APPLICATION_NAME ?? `wagering-${e.ROLE}`,
     aws: {
       region: e.AWS_REGION,
       accessKeyId: e.AWS_ACCESS_KEY_ID,

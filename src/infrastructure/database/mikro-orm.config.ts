@@ -10,9 +10,21 @@ export const migrationsList = [
   { name: 'Migration20261106120000_wagering_schema', class: Migration20261106120000WageringSchema },
 ];
 
-export function buildOrmConfig(databaseUrl: string) {
+export interface OrmConnectionOptions {
+  /** Máximo de conexões do pool (padrão do `pg`: 10). */
+  poolMax?: number;
+  /** `application_name` das conexões, visível no `pg_stat_activity`. */
+  applicationName?: string;
+}
+
+export function buildOrmConfig(databaseUrl: string, options: OrmConnectionOptions = {}) {
   return defineConfig({
     clientUrl: databaseUrl,
+    ...(options.poolMax === undefined ? {} : { pool: { max: options.poolMax } }),
+    // repassado ao Pool do `pg` (o MikroORM ignora parâmetros de query na clientUrl)
+    ...(options.applicationName === undefined
+      ? {}
+      : { driverOptions: { application_name: options.applicationName } }),
     // Records de persistência; o DDL vem das migrations (não usamos o schema generator).
     entities: ENTITY_SCHEMAS,
     extensions: [Migrator],

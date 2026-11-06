@@ -12,8 +12,10 @@ A mesma imagem roda em vários **papéis**, escolhidos por variável de ambiente
 | `outbox` | Publica eventos pendentes da tabela `outbox_messages` |
 | `pending-ref` | Reprocessa transações `PENDING_REFERENCE` com backoff |
 
-`ROLE=all` liga tudo (útil em dev). No docker compose rodamos **3 réplicas** para provar a correção com
-múltiplas instâncias.
+`ROLE=all` liga tudo (útil em dev). A correção com múltiplas instâncias é provada pela suíte de
+concorrência, que sobe **3 processos reais** da aplicação contra o mesmo Postgres (seção 17). O docker
+compose roda uma instância; um perfil com réplicas atrás de um balanceador, para demonstração manual,
+fica para a fase 9.
 
 ```
               HTTP  ─┐                            ┌─> wallets (FOR UPDATE)
@@ -67,6 +69,50 @@ Por que essa estratégia:
 
 **Ordem de lock:** sempre `wallets` antes de `wager_transactions`, para evitar deadlock entre o use case e
 os workers.
+
+### Por que a estratégia é correta
+
+O que precisa valer, mesmo com N instâncias, retries e quedas: nada de lost update, de saldo negativo,
+de débito ou crédito duplicado, nem de saldo e ledger divergentes; e o sistema não pode travar
+(deadlock) nem serializar wallets diferentes.
+
+1. **Exclusão mútua por wallet.** Todo caminho que muda o saldo ou as transações de uma wallet roda numa
+   transação SQL que começa travando a linha dela (`FOR UPDATE`). O Postgres segura esse lock até o
+   COMMIT ou ROLLBACK. Para uma mesma wallet, as seções críticas "ler saldo → decidir → gravar saldo,
+   ledger, transação e outbox → COMMIT" acontecem uma de cada vez. O código não deixa gravar uma wallet
+   sem esse lock (`RepositoryMisuseError`), e o banco recusa um UPDATE feito sobre uma leitura antiga
+   (`tg_wallets_guard_update`).
+2. **Quem pega o lock lê o saldo mais recente.** Em READ COMMITTED, quando o `FOR UPDATE` espera outra
+   transação, o Postgres relê a linha depois do COMMIT dela e devolve a versão nova (não a da
+   fotografia do início do comando). E cada comando seguinte tira uma fotografia nova, já depois do lock.
+   Por isso o saldo lido é sempre o que o dono anterior gravou: não existe lost update. (Em REPEATABLE
+   READ o mesmo cenário daria erro de serialização, seção 15.7.)
+3. **A decisão usa um saldo que não muda até o COMMIT.** A BET sem saldo é rejeitada com o saldo real
+   daquele instante; nada fica negativo. Rede de segurança: `CHECK (balance >= 0)`.
+4. **Idempotência dentro do lock.** Requisições com a mesma key e o mesmo payload apontam para a mesma
+   wallet, então disputam o mesmo lock. A segunda checagem da key, feita depois do lock, enxerga a
+   transação que o dono anterior confirmou e devolve replay. O único caso que não passa pelo mesmo lock
+   (mesma key em wallets diferentes, ou seja, payload diferente) é decidido pelo índice único e vira
+   replay ou conflito. Mesmo com um bug no código, os índices únicos (`ux_wager_tx_idempotency_key`,
+   `ux_wager_tx_provider_external`, `ux_wager_tx_reversal_once`, `ux_ledger_transaction`,
+   `ux_ledger_wallet_version`) impedem que um segundo efeito seja confirmado.
+5. **Tudo ou nada, inclusive numa queda.** Transação, saldo, ledger e outbox são confirmados no mesmo
+   COMMIT. Se o processo morre antes, a conexão cai, o Postgres desfaz a transação e solta o lock. Se
+   morre depois, o efeito está gravado, e o retry com a mesma key recebe o replay. Não existe janela
+   em que metade do efeito fique visível.
+6. **Sem deadlock.** Cada operação trava uma única wallet, e qualquer outra linha (a transação, no
+   worker da fase 7) só é travada depois dela. Com uma ordem única não há ciclo de espera. A espera
+   por uma entrada de índice único (mesma key em duas wallets) é de mão única; se o Postgres ainda
+   assim detectar deadlock (40P01), vira erro transitório (503), nunca inconsistência.
+7. **Sem lock global.** O lock é de uma linha. Wallets diferentes não disputam nada e andam em paralelo.
+8. **N instâncias.** Lock e unicidade vivem no Postgres, não na memória do processo; cada instância é só
+   mais um cliente. Uma instância morta não deixa lock para trás (seção 17).
+9. **Espera limitada.** `lock_timeout` (padrão 5s) limita a espera por uma wallet disputada: estourou,
+   a requisição desiste sem efeito e responde 503 com `Retry-After`, e o provedor repete com a mesma key.
+
+Custos aceitos: uma wallet muito disputada processa uma transação por vez (o throughput dela é
+1 / duração da transação); e o optimistic locking foi descartado porque, numa hot wallet, viraria uma
+fila de retries. A suíte `test/concurrency` testa cada ponto acima com 3 processos reais (seção 17).
 
 ## 5. Idempotência
 
@@ -223,6 +269,11 @@ wallet e reconciliação exigiriam um papel de backoffice.
   de passar em silêncio, e o ponto de injeção precisa ser ajustado.
 - Wallet inexistente no `POST /wagering/transactions` responde 404 sem gravar nada: a FK
   `fk_wager_tx_wallet` não deixa persistir uma transação auditável sem wallet.
+- Uma instância **congelada** (não morta) no meio de uma transação, ou separada do banco por uma
+  partição de rede sem FIN/RST, segura o lock daquela wallet até voltar ou até o keepalive TCP derrubar
+  a conexão. Nesse meio-tempo, só aquela wallet responde 503 (`lock_timeout`). A correção não é
+  afetada: sem COMMIT, nada é confirmado. A mitigação seria `SET LOCAL idle_in_transaction_session_timeout`
+  na UnitOfWork; ainda não está feita (seção 17).
 
 ## 13. Decisões da fase 1 (scaffolding)
 
@@ -401,3 +452,60 @@ Interpretações do enunciado e escolhas de modelagem, todas cobertas por testes
     `pg_stat_activity`, sem sleeps fixos), falha injetada no Postgres no meio do flush e no COMMIT
     (triggers temporários que só disparam para operações marcadas) e 503 por `lock_timeout` com a wallet
     travada por outra conexão. Todos terminam com `wallet.balance == saldo reconstruído pelo ledger`.
+
+## 17. Decisões da fase 5 (concorrência e múltiplas instâncias)
+
+1. **Instâncias são processos reais.** `test/support/cluster.ts` sobe, por arquivo de teste, 3 processos
+   `bun src/main.ts` (`ROLE=api`) contra o banco `wagering_test`. Cada um tem o seu grafo Nest, o seu
+   pool e o seu gerador de ids: o único estado compartilhado é o Postgres.
+   - Porta efêmera (`PORT=0`): a instância só conta como pronta quando o log `application started`
+     informa a porta real. Nenhum sleep.
+   - `application_name` próprio por instância (`<cluster>-<n>-g<geração>`), visível no
+     `pg_stat_activity`.
+   - Queda = `SIGKILL` (TerminateProcess no Windows), sem shutdown gracioso. Reinício = processo novo,
+     com outra porta e outro `application_name`.
+   - Não usamos réplicas do docker compose: exigiriam rebuild da imagem e um balanceador, e o teste não
+     controlaria qual instância cai nem quando.
+2. **Simultaneidade comprovada por uma barreira no Postgres** (`fireThroughWalletLock`): uma conexão do
+   teste trava a wallet (`FOR UPDATE`), as requisições saem pelas 3 instâncias, e o lock só é solto
+   quando o `pg_stat_activity` mostra **todas** esperando por ele, agrupadas por instância. O teste
+   afirma, por exemplo, que as 50 cópias da mesma aposta estavam ao mesmo tempo no lock, vindas dos 3
+   processos. Variantes em rajada, sem barreira, cobrem as ordens em que parte das requisições cai na
+   checagem de idempotência sem lock.
+3. **Asserções independentes da ordem.** A ordem em que o Postgres entrega o lock varia. Os testes
+   afirmam o que vale para qualquer ordem: um único efeito por key; saldo final = abertura + créditos −
+   débitos das transações aplicadas; cada rejeição justificada pelo saldo devolvido naquele instante;
+   e o saldo devolvido igual ao `balance_after` do próprio lançamento.
+4. **Checagem final ampliada** (`expectConsistentWallets`, depois de cada teste): além de
+   `wallet.balance == saldo reconstruído pelo ledger`, confere a sequência do ledger (versões contíguas,
+   `balance_before` = `balance_after` anterior, nenhum saldo intermediário negativo, wallet na versão do
+   último lançamento), um lançamento por transação que move saldo, os eventos exatos de cada desfecho
+   na outbox e nenhum evento de transação que não existe.
+5. **Configuração nova:** `PORT=0` aceito; `DB_POOL_MAX` (padrão 10); `DB_APPLICATION_NAME` (padrão
+   `wagering-<ROLE>`, repassado ao `pg`, já que o MikroORM ignora parâmetros na `clientUrl`). Nos
+   testes, cada instância usa pool 20 (as 50 requisições presas no lock precisam de conexão; 3 × 20
+   cabem nas 100 do Postgres) e `DB_LOCK_TIMEOUT_MS=20000`, para uma máquina lenta não responder 503
+   com a barreira fechada (o 503 por `lock_timeout` é coberto na integração).
+6. **Quedas comprovadas** (`restart.test.ts`):
+   - instância morta com 5 requisições paradas no lock: elas perdem a conexão; nada delas é gravado
+     (nem transação nem evento, conferido pelo `correlationId`); as outras instâncias seguem; o retry
+     aplica cada uma uma vez;
+   - reinício completo (3 processos novos): o reenvio de todas as operações (201, 422 e 202) devolve
+     replays idênticos (a idempotência está no banco, não na memória); a reconciliação dá
+     `consistent: true`; operações novas seguem corretas;
+   - queda das 3 instâncias num ponto arbitrário de uma carga de 120 operações: o retry de tudo aplica
+     cada operação exatamente uma vez (as que tinham chegado ao COMMIT sem resposta voltam como
+     replay); o saldo final é o esperado.
+   - Comportamento observado no Postgres: a conexão de uma instância morta que **espera** um lock não
+     percebe a queda enquanto espera. Ela recebe o lock na sua vez, falha ao responder e desfaz a
+     transação em milissegundos. Já uma conexão que **segura** o lock percebe na hora (está lendo o
+     socket). Por isso o teste espera essas conexões sumirem antes de conferir o banco.
+7. **Resultado.** A suíte não revelou bug no código de processamento: as falhas durante o
+   desenvolvimento foram de expectativa dos próprios testes. As mudanças de código foram as de
+   configuração do item 5. Em 10 execuções seguidas, `bun run test:concurrency` passou nas 10
+   (12 testes cada; de 12 a 15 s, com um ponto fora da curva de 25 s; a maior parte do tempo é para
+   subir processos).
+8. **Fora desta fase:** instância congelada segurando lock (seção 12); SIGTERM gracioso (fase 6; no
+   Windows, `kill` é sempre forçado); itens 5 a 7 da lista de concorrência do desafio (worker morto
+   entre commit e ack, dois publishers, reversão antes da referência), que dependem do consumer e dos
+   workers das fases 6 e 7.

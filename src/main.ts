@@ -20,7 +20,10 @@ async function bootstrap(): Promise<void> {
   const app = await NestFactory.create(AppModule.forRole(config), { logger: false });
   app.enableShutdownHooks();
   await app.listen(config.port, '0.0.0.0');
-  logger.info({ role: config.role, port: config.port }, 'application started');
+  // com PORT=0 o SO escolhe a porta; o log traz a porta real (os testes multi-instância a leem daqui)
+  const address = app.getHttpServer().address();
+  const port = typeof address === 'object' && address !== null ? address.port : config.port;
+  logger.info({ role: config.role, port, pid: process.pid }, 'application started');
 }
 
 await bootstrap();
