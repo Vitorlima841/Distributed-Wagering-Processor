@@ -51,6 +51,11 @@ export interface CreateWagerTransactionProps {
   kind: WagerTransactionKind;
   money: Money;
   referenceExternalTransactionId?: string;
+  /**
+   * Correlação da requisição/mensagem que criou a transação. Metadado: não entra no payloadHash,
+   * mas é guardado para os eventos emitidos depois (worker de PENDING_REFERENCE).
+   */
+  correlationId?: string;
   now: Date;
 }
 
@@ -59,6 +64,7 @@ export interface CreateOpeningTransactionProps {
   walletId: string;
   playerId: string;
   money: Money;
+  correlationId?: string;
   now: Date;
 }
 
@@ -84,6 +90,7 @@ export interface WagerTransactionState {
   balanceAfter?: Money;
   referenceAttempts: number;
   nextAttemptAt?: Date;
+  correlationId?: string;
 }
 
 export class WagerTransaction {
@@ -109,6 +116,8 @@ export class WagerTransaction {
     private _balanceAfter: Money | undefined,
     private _referenceAttempts: number,
     private _nextAttemptAt: Date | undefined,
+    /** Correlação da origem (metadado; fora do payloadHash e imutável). */
+    public readonly correlationId: string | undefined,
   ) {}
 
   /** Nasce em PENDING. OPENING é interno e não pode ser criado por aqui. */
@@ -168,6 +177,7 @@ export class WagerTransaction {
       gameId: INTERNAL_PROVIDER_ID,
       kind: Kind.Opening,
       money: props.money,
+      ...(props.correlationId === undefined ? {} : { correlationId: props.correlationId }),
       now: props.now,
     });
   }
@@ -195,6 +205,7 @@ export class WagerTransaction {
       state.balanceAfter,
       state.referenceAttempts,
       state.nextAttemptAt,
+      state.correlationId,
     );
   }
 
@@ -231,6 +242,7 @@ export class WagerTransaction {
       undefined,
       0,
       undefined,
+      props.correlationId,
     );
   }
 
@@ -285,6 +297,15 @@ export class WagerTransaction {
     }
     this._referenceAttempts += 1;
     this._nextAttemptAt = new Date(now.getTime() + referenceBackoffMs(this._referenceAttempts));
+  }
+
+  /** PENDING_REFERENCE com a próxima tentativa vencida (o worker confere de novo depois do lock). */
+  isReferenceRetryDue(now: Date): boolean {
+    return (
+      this._status === Status.PendingReference &&
+      this._nextAttemptAt !== undefined &&
+      this._nextAttemptAt <= now
+    );
   }
 
   hasExhaustedReferenceAttempts(maxAttempts: number): boolean {

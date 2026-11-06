@@ -103,6 +103,32 @@ export async function createThrowawayDatabase(): Promise<{
   };
 }
 
+export interface IsolatedDatabase {
+  url: string;
+  orm: MikroORM;
+  /** Fecha o ORM e apaga o banco. */
+  drop(): Promise<void>;
+}
+
+/**
+ * Banco descartável já migrado. Para os testes de outbox e de PENDING_REFERENCE: os workers leem
+ * a tabela inteira (o que está vencido), e o `wagering_test` acumula milhares de eventos não
+ * publicados e transações pendentes de outras suítes. Num banco próprio as asserções são exatas.
+ */
+export async function createIsolatedDatabase(): Promise<IsolatedDatabase> {
+  const db = await createThrowawayDatabase();
+  const orm = await MikroORM.init(buildOrmConfig(db.url));
+  await orm.migrator.up();
+  return {
+    url: db.url,
+    orm,
+    drop: async () => {
+      await orm.close(true);
+      await db.drop();
+    },
+  };
+}
+
 /** Executa `fn` numa transação própria; FKs e triggers diferidos são checados no COMMIT. */
 export function inTransaction<T>(orm: MikroORM, fn: (em: EntityManager) => Promise<T>): Promise<T> {
   return orm.em.fork().transactional(fn);

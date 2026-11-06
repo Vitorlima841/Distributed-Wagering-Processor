@@ -16,6 +16,8 @@ const schema = z
       .min(1)
       .refine((v) => /^postgres(ql)?:\/\//.test(v), 'DATABASE_URL deve começar com postgres://'),
     DB_LOCK_TIMEOUT_MS: z.coerce.number().int().min(1).default(5000),
+    // derruba a sessão de um processo congelado no meio de uma transação (solta os locks)
+    DB_IDLE_IN_TRANSACTION_TIMEOUT_MS: z.coerce.number().int().min(1).default(30_000),
     DB_POOL_MAX: z.coerce.number().int().min(1).max(200).default(10),
     DB_APPLICATION_NAME: z
       .string()
@@ -40,10 +42,23 @@ const schema = z
     SQS_RETRY_BASE_DELAY_S: z.coerce.number().int().min(0).max(43_200).default(2),
     SQS_RETRY_MAX_DELAY_S: z.coerce.number().int().min(0).max(43_200).default(60),
     SQS_SHUTDOWN_TIMEOUT_MS: z.coerce.number().int().min(0).default(15_000),
+    // outbox publisher (ARCHITECTURE §19)
+    OUTBOX_BATCH_SIZE: z.coerce.number().int().min(1).max(500).default(50),
+    OUTBOX_POLL_INTERVAL_MS: z.coerce.number().int().min(10).default(500),
+    OUTBOX_PUBLISH_TIMEOUT_MS: z.coerce.number().int().min(100).default(10_000),
+    // worker de PENDING_REFERENCE (ARCHITECTURE §19)
+    PENDING_REF_BATCH_SIZE: z.coerce.number().int().min(1).max(1000).default(100),
+    PENDING_REF_POLL_INTERVAL_MS: z.coerce.number().int().min(10).default(1000),
+    PENDING_REF_MAX_ATTEMPTS: z.coerce.number().int().min(1).max(100).default(10),
   })
   .refine((e) => e.SQS_RETRY_MAX_DELAY_S >= e.SQS_RETRY_BASE_DELAY_S, {
     path: ['SQS_RETRY_MAX_DELAY_S'],
     message: 'deve ser maior ou igual a SQS_RETRY_BASE_DELAY_S',
+  })
+  // o publisher fica ocioso na transação enquanto espera o SQS: o timeout da sessão vem depois
+  .refine((e) => e.DB_IDLE_IN_TRANSACTION_TIMEOUT_MS > e.OUTBOX_PUBLISH_TIMEOUT_MS, {
+    path: ['DB_IDLE_IN_TRANSACTION_TIMEOUT_MS'],
+    message: 'deve ser maior que OUTBOX_PUBLISH_TIMEOUT_MS',
   });
 
 export interface AppConfig {
@@ -53,6 +68,8 @@ export interface AppConfig {
   databaseUrl: string;
   /** Espera máxima por um lock de linha (ex.: wallet disputada) antes de falhar como transitório. */
   dbLockTimeoutMs: number;
+  /** `idle_in_transaction_session_timeout`: sessão parada no meio de uma transação é derrubada. */
+  dbIdleInTransactionTimeoutMs: number;
   /** Máximo de conexões do pool deste processo. */
   dbPoolMax: number;
   /** `application_name` das conexões: identifica o processo no `pg_stat_activity` (quem trava o quê). */
@@ -65,6 +82,24 @@ export interface AppConfig {
   };
   queues: { wager: string; wagerDlq: string; events: string };
   consumer: ConsumerConfig;
+  outbox: OutboxConfig;
+  pendingReference: PendingReferenceConfig;
+}
+
+export interface OutboxConfig {
+  /** Mensagens travadas por ciclo (uma transação por ciclo). */
+  batchSize: number;
+  /** Espera entre ciclos quando não há nada vencido. */
+  pollIntervalMs: number;
+  /** Prazo de cada chamada ao SQS; estourado, as mensagens voltam com backoff. */
+  publishTimeoutMs: number;
+}
+
+export interface PendingReferenceConfig {
+  batchSize: number;
+  pollIntervalMs: number;
+  /** Tentativas antes de REJECTED / REFERENCE_NOT_FOUND. */
+  maxAttempts: number;
 }
 
 export interface ConsumerConfig {
@@ -100,6 +135,7 @@ export function parseConfig(env: Record<string, string | undefined>): AppConfig 
     logLevel: e.LOG_LEVEL,
     databaseUrl: e.DATABASE_URL,
     dbLockTimeoutMs: e.DB_LOCK_TIMEOUT_MS,
+    dbIdleInTransactionTimeoutMs: e.DB_IDLE_IN_TRANSACTION_TIMEOUT_MS,
     dbPoolMax: e.DB_POOL_MAX,
     dbApplicationName: e.DB_APPLICATION_NAME ?? `wagering-${e.ROLE}`,
     aws: {
@@ -121,6 +157,16 @@ export function parseConfig(env: Record<string, string | undefined>): AppConfig 
       retryBaseDelayS: e.SQS_RETRY_BASE_DELAY_S,
       retryMaxDelayS: e.SQS_RETRY_MAX_DELAY_S,
       shutdownTimeoutMs: e.SQS_SHUTDOWN_TIMEOUT_MS,
+    },
+    outbox: {
+      batchSize: e.OUTBOX_BATCH_SIZE,
+      pollIntervalMs: e.OUTBOX_POLL_INTERVAL_MS,
+      publishTimeoutMs: e.OUTBOX_PUBLISH_TIMEOUT_MS,
+    },
+    pendingReference: {
+      batchSize: e.PENDING_REF_BATCH_SIZE,
+      pollIntervalMs: e.PENDING_REF_POLL_INTERVAL_MS,
+      maxAttempts: e.PENDING_REF_MAX_ATTEMPTS,
     },
   };
 }

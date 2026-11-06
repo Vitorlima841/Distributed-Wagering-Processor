@@ -107,11 +107,14 @@ Enunciado: `docs/CHALLENGE.md` · Regras: `CLAUDE.md` · Decisões: `ARCHITECTUR
       em processos com duplicatas, shutdown sem cancelar o long poll (achado no LocalStack), filas
       próprias por arquivo de teste e proxy do SQS para observar/segurar chamadas (ver ARCHITECTURE §18)
 
-### Fase 7 — Outbox + PENDING_REFERENCE ⚠️
-- [ ] Publisher com `FOR UPDATE SKIP LOCKED`, backoff e `markPublished`
-- [ ] Worker PENDING_REFERENCE (ordem de lock wallet → transação, backoff, limite → REJECTED)
-- [ ] Testes: dois publishers na mesma outbox; commit + morte antes de publicar → outra instância publica;
+### Fase 7 — Outbox + PENDING_REFERENCE ⚠️ ✅
+- [x] Publisher com `FOR UPDATE SKIP LOCKED`, backoff e `markPublished`
+- [x] Worker PENDING_REFERENCE (ordem de lock wallet → transação, backoff, limite → REJECTED)
+- [x] Testes: dois publishers na mesma outbox; commit + morte antes de publicar → outra instância publica;
       REFUND/ROLLBACK antes da referência; esgotar tentativas
+- [x] Extra: publicação duplicada deduplicada por um consumidor com inbox; "nunca antes do COMMIT"
+      com a transação presa no COMMIT; `correlation_id` na transação; guarda da outbox no schema;
+      `idle_in_transaction_session_timeout`; dois workers em processos (ver ARCHITECTURE §19)
 
 ### Fase 8 — Observabilidade
 - [ ] Logger JSON com contexto (`correlationId` propagado do HTTP/SQS até o evento)

@@ -14,7 +14,11 @@ import {
   type WagerTransaction,
 } from './wager-transaction';
 
-/** Limite provisório de reprocessamentos de PENDING_REFERENCE; calibrado na fase 7. */
+/**
+ * Reprocessamentos de PENDING_REFERENCE antes de REJECTED / REFERENCE_NOT_FOUND. Com o backoff de
+ * 1s, 2s, 4s… (teto de 60s), a 10ª tentativa acontece cerca de 5 min depois da chegada
+ * (justificativa em ARCHITECTURE §19).
+ */
 export const DEFAULT_MAX_REFERENCE_ATTEMPTS = 10;
 
 export interface WagerPolicyContext {

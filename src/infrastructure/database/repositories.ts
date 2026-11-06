@@ -5,6 +5,7 @@ import {
   type LedgerPageQuery,
   type LedgerRepository,
   type OutboxRepository,
+  type PendingReferenceCandidate,
   RepositoryMisuseError,
   type WagerTransactionRepository,
   type WalletRepository,
@@ -43,6 +44,14 @@ import {
  */
 
 const FOR_UPDATE = { lockMode: LockMode.PESSIMISTIC_WRITE, refresh: true } as const;
+
+/** Candidatos do worker, pelo índice parcial `ix_wager_tx_pending_reference_due`. Sem lock. */
+const DUE_PENDING_REFERENCES_SQL = /* sql */ `
+select id::text as "transactionId", wallet_id::text as "walletId"
+  from wager_transactions
+ where status = 'PENDING_REFERENCE' and next_attempt_at <= ?
+ order by next_attempt_at, id
+ limit ?`;
 
 export class MikroOrmWalletRepository implements WalletRepository {
   private readonly records = new Map<string, WalletRecord>();
@@ -109,6 +118,10 @@ export class MikroOrmWagerTransactionRepository implements WagerTransactionRepos
 
   async findByIdempotencyKey(idempotencyKey: string): Promise<WagerTransaction | undefined> {
     return this.track(await this.em.findOne(WagerTransactionRecord, { idempotencyKey }));
+  }
+
+  async findDuePendingReferences(now: Date, limit: number): Promise<PendingReferenceCandidate[]> {
+    return this.em.execute<PendingReferenceCandidate[]>(DUE_PENDING_REFERENCES_SQL, [now, limit]);
   }
 
   async findByProviderAndExternalId(
@@ -212,6 +225,8 @@ export class MikroOrmInboxRepository implements InboxRepository {
 }
 
 export class MikroOrmOutboxRepository implements OutboxRepository {
+  private readonly records = new Map<string, OutboxMessageRecord>();
+
   constructor(private readonly em: EntityManager) {}
 
   async add(message: OutboxMessage): Promise<void> {
@@ -220,7 +235,42 @@ export class MikroOrmOutboxRepository implements OutboxRepository {
 
   async findById(id: string): Promise<OutboxMessage | undefined> {
     const record = await this.em.findOne(OutboxMessageRecord, { id });
-    return record ? OutboxMessageMapper.toDomain(record) : undefined;
+    return record ? this.track(record) : undefined;
+  }
+
+  /** `FOR UPDATE SKIP LOCKED` pelo índice parcial `ix_outbox_due`, os mais atrasados primeiro. */
+  async claimDue(now: Date, limit: number): Promise<OutboxMessage[]> {
+    const records = await this.em.find(
+      OutboxMessageRecord,
+      { publishedAt: null, nextAttemptAt: { $lte: now } },
+      {
+        orderBy: { nextAttemptAt: 'asc', id: 'asc' },
+        limit,
+        lockMode: LockMode.PESSIMISTIC_PARTIAL_WRITE,
+        refresh: true,
+      },
+    );
+    return records.map((record) => this.track(record));
+  }
+
+  async save(message: OutboxMessage): Promise<void> {
+    const record = this.records.get(message.id);
+    if (!record) {
+      throw new RepositoryMisuseError(
+        `Mensagem de outbox ${message.id} precisa ser lida nesta UnitOfWork antes de save`,
+      );
+    }
+    // só o estado de entrega muda; o envelope é imutável (tg_outbox_guard_update)
+    record.attempts = message.attempts;
+    record.publishedAt = message.publishedAt ?? null;
+    if (message.nextAttemptAt !== undefined) {
+      record.nextAttemptAt = message.nextAttemptAt;
+    }
+  }
+
+  private track(record: OutboxMessageRecord): OutboxMessage {
+    this.records.set(record.id, record);
+    return OutboxMessageMapper.toDomain(record);
   }
 }
 

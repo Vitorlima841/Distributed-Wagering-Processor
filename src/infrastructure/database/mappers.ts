@@ -104,6 +104,7 @@ export const WagerTransactionMapper = {
       balanceAfter: optionalMoney(r.balanceAfter, r.balanceAfterCurrency),
       referenceAttempts: r.referenceAttempts,
       nextAttemptAt: r.nextAttemptAt ?? undefined,
+      ...(r.correlationId === null ? {} : { correlationId: r.correlationId }),
     });
   },
 
@@ -124,6 +125,7 @@ export const WagerTransactionMapper = {
       currency: amount.currency,
       referenceExternalTransactionId: t.referenceExternalTransactionId ?? null,
       createdAt: t.createdAt,
+      correlationId: t.correlationId ?? null,
       ...WagerTransactionMapper.mutable(t),
     };
   },

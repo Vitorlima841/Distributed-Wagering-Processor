@@ -13,6 +13,11 @@ import {
 export interface UnitOfWorkOptions {
   /** `SET LOCAL lock_timeout`: quanto uma transação espera por um lock antes de desistir. */
   lockTimeoutMs: number;
+  /**
+   * `SET LOCAL idle_in_transaction_session_timeout`: uma sessão parada no meio da transação (processo
+   * congelado, partição de rede) é derrubada pelo Postgres, que desfaz a transação e solta os locks.
+   */
+  idleInTransactionTimeoutMs?: number;
 }
 
 /**
@@ -26,6 +31,7 @@ export interface UnitOfWorkOptions {
  */
 export class MikroOrmUnitOfWork implements UnitOfWork {
   private readonly lockTimeoutMs: number;
+  private readonly idleInTransactionTimeoutMs: number | undefined;
 
   constructor(
     private readonly orm: MikroORM,
@@ -35,6 +41,11 @@ export class MikroOrmUnitOfWork implements UnitOfWork {
       throw new Error('lockTimeoutMs deve ser um inteiro positivo');
     }
     this.lockTimeoutMs = options.lockTimeoutMs;
+    const idle = options.idleInTransactionTimeoutMs;
+    if (idle !== undefined && (!Number.isInteger(idle) || idle <= 0)) {
+      throw new Error('idleInTransactionTimeoutMs deve ser um inteiro positivo');
+    }
+    this.idleInTransactionTimeoutMs = idle;
   }
 
   async run<T>(work: (scope: TransactionScope) => Promise<T>): Promise<T> {
@@ -42,6 +53,11 @@ export class MikroOrmUnitOfWork implements UnitOfWork {
       return await this.orm.em.fork().transactional(
         async (em) => {
           await em.execute(`set local lock_timeout = ${this.lockTimeoutMs}`);
+          if (this.idleInTransactionTimeoutMs !== undefined) {
+            await em.execute(
+              `set local idle_in_transaction_session_timeout = ${this.idleInTransactionTimeoutMs}`,
+            );
+          }
           return work(createScope(em));
         },
         { isolationLevel: IsolationLevel.READ_COMMITTED },

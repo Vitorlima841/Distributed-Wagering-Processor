@@ -3,21 +3,28 @@ import type { INestApplication } from '@nestjs/common';
 import { NestFactory } from '@nestjs/core';
 import { AppModule } from '../../src/app.module';
 import { parseConfig } from '../../src/infrastructure/config/app-config';
-import { ensureTestDatabase } from '../support/database';
+import { createIsolatedDatabase, type IsolatedDatabase } from '../support/database';
+import { TestEventsQueue } from '../support/events-queue';
 import { TestQueues } from '../support/sqs';
 
 describe('GET /health/live', () => {
   let app: INestApplication;
   let baseUrl: string;
   let queues: TestQueues;
+  let events: TestEventsQueue;
+  let db: IsolatedDatabase;
 
   beforeAll(async () => {
-    await ensureTestDatabase();
-    // ROLE=all liga o consumer de verdade: filas próprias, para não consumir a fila do ambiente
+    // ROLE=all liga consumer, outbox publisher e worker de PENDING_REFERENCE de verdade: filas e
+    // banco próprios, para não consumir a fila do ambiente nem mexer nos dados de outros testes
     queues = await TestQueues.create();
+    events = await TestEventsQueue.create();
+    db = await createIsolatedDatabase();
     const config = parseConfig({
       ...process.env,
       ...queues.consumerEnv(),
+      ...events.publisherEnv(),
+      DATABASE_URL: db.url,
       ROLE: 'all',
       LOG_LEVEL: 'silent',
     });
@@ -29,6 +36,8 @@ describe('GET /health/live', () => {
   afterAll(async () => {
     await app.close();
     await queues.destroy();
+    await events.destroy();
+    await db.drop();
   });
 
   test('responde 200 sem autenticação', async () => {

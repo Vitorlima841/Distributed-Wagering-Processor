@@ -96,7 +96,12 @@ export class ProcessWagerTransaction {
   ): Promise<WagerTransactionOutcome> {
     const props = parseCommand(command);
     const build = () =>
-      WagerTransaction.create({ ...props, id: this.ids.newId(), now: this.clock.now() });
+      WagerTransaction.create({
+        ...props,
+        id: this.ids.newId(),
+        correlationId: command.correlationId,
+        now: this.clock.now(),
+      });
     // Valida o payload inteiro antes de abrir transação: erro aqui não toca o banco.
     let candidate = build();
     for (let attempt = 1; ; attempt += 1) {

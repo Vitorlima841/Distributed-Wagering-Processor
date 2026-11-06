@@ -62,6 +62,7 @@ export class CreateWallet {
         }
         const opening = WagerTransaction.opening({
           id: openingTransactionId,
+          correlationId: command.correlationId,
           walletId,
           playerId,
           money: initialBalance,

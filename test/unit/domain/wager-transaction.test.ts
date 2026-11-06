@@ -406,3 +406,26 @@ describe('WagerTransaction.rehydrate', () => {
     );
   });
 });
+
+describe('fase 7: correlação e vencimento do reprocessamento', () => {
+  test('correlationId é guardado, mas não entra no payloadHash (replay com outra correlação)', () => {
+    const original = WagerTransaction.create(props({ correlationId: 'corr-a' }));
+    const retry = WagerTransaction.create(props({ id: 'tx-2', correlationId: 'corr-b' }));
+    expect(original.correlationId).toBe('corr-a');
+    expect(original.payloadHash).toBe(retry.payloadHash);
+    expect(WagerTransaction.create(props()).correlationId).toBeUndefined();
+  });
+
+  test('isReferenceRetryDue: só PENDING_REFERENCE com a próxima tentativa vencida', () => {
+    const tx = refund();
+    expect(tx.isReferenceRetryDue(at(100))).toBe(false); // PENDING
+    tx.markPendingReference(brl('10.00'), T0);
+    expect(tx.isReferenceRetryDue(at(0.999))).toBe(false);
+    expect(tx.isReferenceRetryDue(at(1))).toBe(true);
+    tx.scheduleReferenceRetry(at(1)); // próxima em at(3)
+    expect(tx.isReferenceRetryDue(at(2))).toBe(false);
+    expect(tx.isReferenceRetryDue(at(3))).toBe(true);
+    tx.reject(FailureCode.ReferenceNotFound, brl('10.00'), at(3));
+    expect(tx.isReferenceRetryDue(at(100))).toBe(false);
+  });
+});

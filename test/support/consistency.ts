@@ -11,7 +11,8 @@ import { expectBalanceMatchesLedger } from './database';
  *     e no saldo do último lançamento (sem lost update);
  *  3. exatamente um lançamento por transação PROCESSED que move saldo, nenhum para as demais;
  *  4. eventos na outbox: exatamente os do desfecho de cada transação (nem duplicados nem faltando)
- *     e nenhum evento de transação que não existe.
+ *     e nenhum evento de transação que não existe. Uma reversão resolvida depois pelo worker de
+ *     PENDING_REFERENCE tem também o `WagerTransactionPendingReference` da chegada.
  * O banco já impõe boa parte disso; o teste confere o resultado do lado de fora.
  */
 export async function expectConsistentWallets(
@@ -87,6 +88,12 @@ interface EffectRow {
   kind: string;
   status: string;
   entries: number;
+  /**
+   * Terminal resolvido pelo worker de PENDING_REFERENCE. O use case grava `processed_at` com o
+   * instante de criação (decisão na chegada); o worker grava o instante da tentativa, sempre
+   * depois (a primeira tentativa vence 1s após a chegada).
+   */
+  resolvedLater: boolean;
 }
 
 /**
@@ -102,7 +109,8 @@ async function expectOneEffectPerTransaction(orm: MikroORM, walletIds: string[])
   const rows = await em.execute<EffectRow[]>(
     `select t.id, t.kind, t.status,
             (select count(*)::int from wallet_ledger_entries l where l.transaction_id = t.id)
-              as entries
+              as entries,
+            (t.processed_at is not null and t.processed_at > t.created_at) as "resolvedLater"
        from wager_transactions t
       where t.wallet_id = any(string_to_array(?, ',')::uuid[])`,
     [csv],
@@ -133,6 +141,11 @@ async function expectOneEffectPerTransaction(orm: MikroORM, walletIds: string[])
 }
 
 function expectedEvents(row: EffectRow): string[] {
+  const terminal = terminalEvents(row);
+  return row.resolvedLater ? ['WagerTransactionPendingReference', ...terminal].sort() : terminal;
+}
+
+function terminalEvents(row: EffectRow): string[] {
   switch (row.status) {
     case 'PROCESSED':
       return row.kind === 'LOSS'

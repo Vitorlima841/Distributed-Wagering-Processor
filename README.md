@@ -6,9 +6,9 @@ provedores. NestJS + Bun + TypeScript estrito + MikroORM + PostgreSQL + SQS (Loc
 Enunciado: [docs/CHALLENGE.md](docs/CHALLENGE.md) · Plano: [docs/PLAN.md](docs/PLAN.md) ·
 Decisões: [ARCHITECTURE.md](ARCHITECTURE.md)
 
-> Estado atual: **fase 6** (domínio, persistência, use cases, API HTTP, suíte de concorrência e
-> consumer SQS com inbox, retry/DLQ e shutdown gracioso). Outbox publisher e worker de
-> PENDING_REFERENCE ainda são casca (fase 7).
+> Estado atual: **fase 7** (domínio, persistência, use cases, API HTTP, suíte de concorrência,
+> consumer SQS com inbox, retry/DLQ e shutdown gracioso, outbox publisher e worker de
+> PENDING_REFERENCE). Observabilidade (fase 8) ainda não.
 
 ## Requisitos
 
@@ -43,7 +43,7 @@ bun run dev
 ## Papéis (`ROLE`)
 
 `api` · `consumer` · `outbox` · `pending-ref` · `all` (padrão). Todo processo expõe HTTP
-(`/health/live`). Outbox e pending-ref são apenas casca nesta fase.
+(`/health/live`).
 
 ```bash
 ROLE=api docker compose up -d app
@@ -64,6 +64,25 @@ backoff (2s, 4s, 8s… até 60s) e, depois de 5 recebimentos, o SQS move para
 `wager-transactions-dlq.fifo`; mensagem inválida, conflito ou wallet inexistente → DLQ na hora, com
 o motivo nos atributos `failure-kind` / `failure-code`. Detalhes em
 [ARCHITECTURE.md §9 e §18](ARCHITECTURE.md).
+
+### Outbox publisher e worker de PENDING_REFERENCE
+
+- `outbox`: publica `outbox_messages` na fila standard `wagering-events`, em lotes travados com
+  `FOR UPDATE SKIP LOCKED` (vários publishers não pegam a mesma linha). Só enxerga o que já foi
+  confirmado; se morrer antes do COMMIT, outra instância publica. Garantia at-least-once: o
+  consumidor deduplica pelo `eventId` (corpo e atributo `event-id`). Falha ao publicar → backoff
+  1s, 2s, 4s… até 60s, sem desistir.
+- `pending-ref`: reprocessa REFUND/ROLLBACK que chegaram antes da referência, travando a wallet antes
+  da transação, com backoff 1s, 2s, 4s… (teto 60s). Na 10ª tentativa sem referência (~5 min depois da
+  chegada) a transação vira `REJECTED` / `REFERENCE_NOT_FOUND` e emite `WagerTransactionRejected`.
+
+Para ler os eventos publicados no ambiente local:
+
+```bash
+docker compose exec localstack awslocal sqs receive-message --queue-url http://localhost:4566/000000000000/wagering-events --max-number-of-messages 10 --message-attribute-names All
+```
+
+Detalhes em [ARCHITECTURE.md §9 e §19](ARCHITECTURE.md).
 
 ## Configuração (variáveis de ambiente)
 
@@ -100,6 +119,12 @@ queda de instâncias (kill sem aviso) e reinício completo. Detalhes em
 `consumer-crash.test.ts` sobe consumers como processos (`ROLE=consumer`): um é morto depois do
 COMMIT e antes do ack (um proxy na frente do LocalStack segura o `DeleteMessage`) e outro recebe a
 reentrega sem repetir o efeito; três consumers processam juntos uma carga com mensagens duplicadas.
+
+`outbox-publishers.test.ts` e `pending-reference-workers.test.ts` sobem publishers (`ROLE=outbox`) e
+workers (`ROLE=pending-ref`) como processos, num **banco descartável** próprio (os workers leem a
+tabela inteira, e o `wagering_test` acumula eventos e pendências de outras suítes): dois publishers na
+mesma outbox, publisher morto antes de publicar, publicação duplicada deduplicada pelo consumidor e
+dois workers disputando as mesmas PENDING_REFERENCE.
 
 ### Testes do consumer SQS
 

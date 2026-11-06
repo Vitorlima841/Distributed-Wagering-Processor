@@ -23,7 +23,10 @@ import { MikroOrmUnitOfWork } from './mikro-orm-unit-of-work';
       provide: UNIT_OF_WORK,
       inject: [MikroORM, APP_CONFIG],
       useFactory: (orm: MikroORM, config: AppConfig) =>
-        new MikroOrmUnitOfWork(orm, { lockTimeoutMs: config.dbLockTimeoutMs }),
+        new MikroOrmUnitOfWork(orm, {
+          lockTimeoutMs: config.dbLockTimeoutMs,
+          idleInTransactionTimeoutMs: config.dbIdleInTransactionTimeoutMs,
+        }),
     },
   ],
   exports: [MikroORM, UNIT_OF_WORK],

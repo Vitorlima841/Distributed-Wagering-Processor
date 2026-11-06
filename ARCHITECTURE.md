@@ -227,20 +227,26 @@ O replay de uma transação que estava PENDING_REFERENCE e já foi resolvida dev
 - `SIGTERM`: não busca mais, termina a mensagem em andamento de cada grupo e devolve as demais com
   visibilidade 0 (`enableShutdownHooks`).
 
-**Outbox publisher:**
-- Loop: `SELECT ... WHERE published_at IS NULL AND next_attempt_at <= now() ORDER BY occurred_at
-  FOR UPDATE SKIP LOCKED LIMIT 50` → publica → `published_at = now()` → `COMMIT`.
-- Vários publishers não pegam a mesma linha (`SKIP LOCKED`). Se o processo morre, a transação faz rollback,
-  o lock é solto e outra instância assume.
-- Garantia **at-least-once**: se publicar e morrer antes do commit, o evento sai duas vezes. O consumidor
-  deduplica por `eventId`.
-- Falha ao publicar → `scheduleRetry` (backoff exponencial com teto).
-- Destino dos eventos: fila `wagering-events` *(o desafio não define, decisão nossa)*.
+**Outbox publisher** (papel `outbox`, detalhes na seção 19):
+- Um ciclo = uma transação: `SELECT ... WHERE published_at IS NULL AND next_attempt_at <= $agora
+  ORDER BY next_attempt_at, id LIMIT 50 FOR UPDATE SKIP LOCKED` → `SendMessageBatch` (lotes de 10) →
+  `markPublished` nas aceitas e `scheduleRetry` nas demais → `COMMIT`.
+- Só enxerga linhas confirmadas (READ COMMITTED): **nenhum evento sai antes do COMMIT** da transação
+  financeira que o gravou.
+- Vários publishers não pegam a mesma linha (`SKIP LOCKED`: a linha travada é pulada, não esperada).
+  Se o processo morre, a transação faz rollback, o lock é solto e outra instância assume.
+- Garantia **at-least-once**: se publicar e morrer antes do COMMIT, o evento sai duas vezes, idêntico.
+  O consumidor deduplica por `eventId` (no corpo e no atributo `event-id`).
+- Falha ao publicar → `scheduleRetry`: 1s, 2s, 4s… teto de 60s, **sem limite de tentativas**
+  (desistir seria perder um evento confirmado).
+- Destino: fila standard `wagering-events` *(o desafio não define, decisão nossa)*.
 
-**Worker PENDING_REFERENCE:**
-- Seleciona candidatos vencidos (`next_attempt_at <= now()`) sem lock e, para cada um, abre uma transação
-  que trava a **wallet primeiro** e depois a transação (ordem de lock).
-- Backoff exponencial: 1s, 2s, 4s… com teto de 60s; **máximo de 10 tentativas** *(a calibrar)*.
+**Worker PENDING_REFERENCE** (papel `pending-ref`, detalhes na seção 19):
+- Seleciona candidatos vencidos sem lock e, para cada um, abre uma transação que trava a **wallet
+  primeiro** e depois a transação (ordem de lock); confere de novo se ainda está vencida e chama o
+  mesmo núcleo do use case (`applyWager`).
+- Backoff exponencial: 1s, 2s, 4s… com teto de 60s; **10 tentativas** (rejeição cerca de 5 min depois
+  da chegada).
 - Esgotado o limite → `REJECTED` / `REFERENCE_NOT_FOUND` + evento `WagerTransactionRejected`.
 
 ## 10. Observabilidade
@@ -275,10 +281,11 @@ wallet e reconciliação exigiriam um papel de backoffice.
 - Wallet inexistente no `POST /wagering/transactions` responde 404 sem gravar nada: a FK
   `fk_wager_tx_wallet` não deixa persistir uma transação auditável sem wallet.
 - Uma instância **congelada** (não morta) no meio de uma transação, ou separada do banco por uma
-  partição de rede sem FIN/RST, segura o lock daquela wallet até voltar ou até o keepalive TCP derrubar
-  a conexão. Nesse meio-tempo, só aquela wallet responde 503 (`lock_timeout`). A correção não é
-  afetada: sem COMMIT, nada é confirmado. A mitigação seria `SET LOCAL idle_in_transaction_session_timeout`
-  na UnitOfWork; ainda não está feita (seção 17).
+  partição de rede sem FIN/RST, segura o lock daquela wallet. Desde a fase 7, a UnitOfWork roda
+  `SET LOCAL idle_in_transaction_session_timeout` (`DB_IDLE_IN_TRANSACTION_TIMEOUT_MS`, padrão 30s):
+  parada entre dois comandos, a sessão é derrubada pelo Postgres e o lock é solto. Uma instância
+  congelada **no meio de um comando** (raro: os comandos são curtos) ainda depende do keepalive TCP.
+  A correção não é afetada: sem COMMIT, nada é confirmado.
 - **Consumer SQS** (seção 18):
   - Mensagens que estavam com uma instância morta sem aviso (SIGKILL) só voltam depois da visibilidade
     (30s). A correção não muda: a reentrega cai na inbox.
@@ -293,6 +300,20 @@ wallet e reconciliação exigiriam um papel de backoffice.
     desiste é a DLQ, e a key fica livre para reprocessar depois da correção.
   - O teste com SIGTERM real num processo só roda em Linux/macOS; no Windows ele é pulado (e o README
     mostra como rodá-lo num container).
+- **Outbox e PENDING_REFERENCE** (seção 19):
+  - A fila de eventos é standard: sem ordem entre eventos e com cópias possíveis. Quem precisa de ordem
+    por wallet usa o `walletVersion` do `WalletBalanceChanged`.
+  - O publisher segura os locks do lote durante a chamada ao SQS (até `OUTBOX_PUBLISH_TIMEOUT_MS`).
+    Só publishers disputam essas linhas, e eles as pulam; o custo é uma transação aberta pelo tempo
+    da chamada.
+  - Um evento que o SQS recusa sempre (ex.: maior que 256 KB, longe do tamanho dos envelopes atuais)
+    fica em retry a cada 60s para sempre, com log `warn`; a métrica entra na fase 8.
+  - Uma reversão rejeitada com `REFERENCE_NOT_FOUND` é terminal: se a referência chegar depois, a
+    reversão não volta sozinha, e o provedor precisa reenviá-la com outro id (`fix_payload`).
+  - O worker não é acordado pela chegada da referência: a reversão espera a próxima tentativa
+    agendada (até 60s depois das primeiras tentativas).
+  - Transações gravadas antes da migration da fase 7 não têm `correlation_id`; os eventos do worker
+    para elas usam o id da transação como correlação.
 
 ## 13. Decisões da fase 1 (scaffolding)
 
@@ -350,7 +371,7 @@ Interpretações do enunciado e escolhas de modelagem, todas cobertas por testes
    - Retry de `PENDING_REFERENCE`: `referenceAttempts` e `nextAttemptAt` vivem na transação;
      `scheduleReferenceRetry(now)` aplica backoff 1s, 2s, 4s… com teto de 60s. `PENDING_REFERENCE →
      PENDING_REFERENCE` só por esse método. O limite de tentativas (provisório: 10,
-     `DEFAULT_MAX_REFERENCE_ATTEMPTS`) é calibrado na fase 7.
+     `DEFAULT_MAX_REFERENCE_ATTEMPTS`) foi confirmado na fase 7 (seção 19.3).
    - `WagerTransaction.assertReplayOf(hash)` lança `IdempotencyConflictError` quando a mesma key chega com
      payload diferente.
    - `fail()` só aceita `INFRA_PERMANENT_ERROR`; `reject()` aceita os demais códigos.
@@ -526,7 +547,7 @@ Interpretações do enunciado e escolhas de modelagem, todas cobertas por testes
    subir processos).
 8. **Fora desta fase:** instância congelada segurando lock (seção 12); SIGTERM gracioso e worker morto
    entre commit e ack (feitos na fase 6, seção 18); dois publishers e reversão antes da referência
-   (fase 7).
+   (feitos na fase 7, seção 19).
 
 ## 18. Decisões da fase 6 (consumer SQS)
 
@@ -630,3 +651,99 @@ Interpretações do enunciado e escolhas de modelagem, todas cobertas por testes
       processos com 72 mensagens (duplicadas e reenviadas com outro `messageId`) → cada operação
       aplicada uma vez.
     - Os testes novos de SQS passaram 5 vezes seguidas (cerca de 34 s por execução).
+
+## 19. Decisões da fase 7 (outbox publisher e worker de PENDING_REFERENCE)
+
+1. **Publisher: uma transação por lote** (`PublishOutbox`, `src/application/messaging`).
+   `claimDue` faz `FOR UPDATE SKIP LOCKED` pelo índice parcial `ix_outbox_due`, publica pelo port
+   `EventPublisher` e grava `markPublished` / `scheduleRetry` antes do COMMIT.
+   - **Por que segurar o lock durante a chamada ao SQS** (e não um lease com coluna `locked_until`):
+     a recuperação de uma queda vem de graça (o rollback solta o lock, sem expiração a calibrar), sem
+     migration nem estado extra. O custo, uma transação aberta pelo tempo da chamada, é limitado por
+     `OUTBOX_PUBLISH_TIMEOUT_MS` (10s); só outros publishers disputam essas linhas, e eles pulam em vez
+     de esperar.
+   - O publisher **só enxerga o que foi confirmado** (READ COMMITTED). Não existe caminho para publicar
+     antes do COMMIT da transação financeira: nem o use case nem o consumer falam com o broker.
+   - Resultado por mensagem: o `SendMessageBatch` informa sucesso e falha de cada entrada, e um lote que
+     falha inteiro (timeout, SQS fora do ar) não impede os outros. Mensagem sem confirmação explícita
+     conta como falha. O motivo logado é só o código do erro, sem conteúdo do evento.
+   - **Sem limite de tentativas:** desistir perderia um evento confirmado (invariante do desafio). O
+     backoff de `OutboxMessage` (1s, 2s, 4s… teto 60s) fica no `next_attempt_at` do banco, então vale
+     para qualquer instância.
+   - Ordem do `claimDue`: `next_attempt_at, id` (a ordem do índice; o §9 dizia `occurred_at`). É só
+     preferência: a fila é standard.
+2. **Fila standard `wagering-events`, não FIFO.** O corpo é o envelope gravado na outbox, sem mudança;
+   os atributos `event-id`, `event-type`, `aggregate-id` e `correlation-id` permitem filtrar e
+   deduplicar sem abrir o corpo. A ordem por wallet sai do `walletVersion` do `WalletBalanceChanged`,
+   que é contíguo. Uma FIFO por `aggregateId` não ordenaria eventos de agregados diferentes (transação
+   e wallet) e limitaria o throughput por grupo.
+3. **Limite do PENDING_REFERENCE: 10 tentativas, contadas por tentativa (não TTL).**
+   - Cronograma: 1ª tentativa 1s depois da chegada; depois 2s, 4s, 8s, 16s, 32s e 60s × 4. A 10ª
+     tentativa (a que rejeita) acontece **303 s (~5 min) depois da chegada**.
+   - Por que 5 min: a referência fora de ordem vem de entregas concorrentes ou de retries do provedor.
+     O consumer SQS tenta por ~1 min antes da DLQ (seção 18.5) e o HTTP devolve 503 com
+     `Retry-After: 1`; 5 min cobrem com folga os dois caminhos e ainda dão ao provedor uma resposta
+     definitiva rápida (`REFERENCE_NOT_FOUND` → `fix_payload`). Mais que isso deixaria uma reversão
+     legítima sem resposta por muito tempo.
+   - Por que por tentativa e não por TTL: se o worker ficar fora do ar, um TTL rejeitaria de uma vez
+     tudo o que venceu durante a queda, sem nenhuma tentativa real. Contando tentativas, cada reversão
+     tem as suas 10 chances de encontrar a referência.
+   - Configurável por `PENDING_REF_MAX_ATTEMPTS`; o backoff fica no domínio (`WagerTransaction`).
+4. **Worker: candidatos sem lock, lock wallet → transação, nova checagem** (`RetryPendingReferences`).
+   - Travar a transação na busca (`SKIP LOCKED` em `wager_transactions`) inverteria a ordem de lock e
+     abriria espaço para deadlock com o use case. Por isso a busca é sem lock, e dois workers podem ler
+     o mesmo candidato.
+   - Depois dos dois locks, o worker confere `isReferenceRetryDue(agora)`. Quem chega depois encontra a
+     tentativa já agendada para o futuro (ou a transação terminal) e pula (`SKIPPED`). Uma tentativa
+     nunca é contada duas vezes, e o trigger de guarda impede `reference_attempts` de diminuir.
+   - O reprocessamento é o mesmo `applyWager` do use case (`isNew: false`): todas as regras de
+     referência valem (por exemplo, `AMOUNT_MISMATCH` se a referência chegar com outro valor), com saldo,
+     ledger, transação e outbox na mesma transação SQL.
+   - Um erro num candidato (lock timeout numa wallet disputada) é registrado e não impede os outros;
+     nada foi gravado, e ele volta no próximo ciclo.
+5. **`correlation_id` em `wager_transactions`** (migration `Migration20261106180000`). Os eventos do
+   worker levam a correlação da requisição ou mensagem original. Metadado: não entra no
+   `payload_hash`, é imutável (`tg_wager_tx_guard_correlation`) e tem formato checado
+   (`ck_wager_tx_correlation_id`: até 128 caracteres ASCII visíveis, como o `X-Correlation-Id` e o
+   `messageId`). Anulável só para as linhas anteriores à migration.
+6. **Guarda da outbox no schema** (mesma migration): `tg_outbox_guard_update` (envelope imutável,
+   mensagem publicada não muda mais, `attempts` não diminui) e `tg_outbox_no_pending_delete` (apagar
+   mensagem pendente perderia um evento confirmado; apagar publicada continua possível, para retenção).
+7. **`idle_in_transaction_session_timeout`** em toda UnitOfWork (`DB_IDLE_IN_TRANSACTION_TIMEOUT_MS`,
+   padrão 30s, validado acima de `OUTBOX_PUBLISH_TIMEOUT_MS`): um publisher (ou qualquer instância)
+   congelado no meio de uma transação perde a sessão e solta os locks (seção 12).
+8. **Workers no Nest:** `PollingWorker` (`src/interfaces/workers`) roda um ciclo atrás do outro quando o
+   lote vem cheio e espera o intervalo quando não; um ciclo que falha (banco fora) pausa com backoff
+   (500 ms até 30 s) sem matar o loop. No SIGTERM (`beforeApplicationShutdown`) não começa outro ciclo
+   e espera o atual terminar. Nenhum estado de negócio fica em memória: o banco diz o que está vencido.
+   Configuração nova: `OUTBOX_BATCH_SIZE` (50), `OUTBOX_POLL_INTERVAL_MS` (500),
+   `OUTBOX_PUBLISH_TIMEOUT_MS` (10000), `PENDING_REF_BATCH_SIZE` (100), `PENDING_REF_POLL_INTERVAL_MS`
+   (1000), `PENDING_REF_MAX_ATTEMPTS` (10), `DB_IDLE_IN_TRANSACTION_TIMEOUT_MS` (30000).
+9. **Testes** (Postgres e LocalStack reais; todos terminam com `expectConsistentWallets`):
+   - Banco **descartável e migrado por arquivo** (`createIsolatedDatabase`): os workers leem a tabela
+     inteira, e o `wagering_test` acumula milhares de eventos e pendências de outras suítes. Fila de
+     eventos própria por arquivo (`TestEventsQueue`). O teste de health (`ROLE=all`, que agora liga os
+     workers) também passou a usar banco e filas próprios.
+   - O `SqsProxy` ganhou `holdResponse` (o SQS recebeu, o cliente ainda não sabe) e `fail` (o SQS
+     recusa).
+   - `expectConsistentWallets` reconhece a reversão resolvida pelo worker (`processed_at > created_at`:
+     o use case grava os dois com o mesmo instante) e passa a exigir também o
+     `WagerTransactionPendingReference` da chegada.
+   - `test/integration/outbox/publisher.test.ts`: envelope intacto e `published_at`; **nunca antes do
+     COMMIT** (um trigger de teste prende a BET no COMMIT com tudo escrito, e o publisher não a vê);
+     dois publishers com SKIP LOCKED (o lote travado por A é pulado por B, sem espera nem duplicata);
+     SQS recusando, com backoff 1s, 2s, 4s observado num relógio controlado.
+   - `test/integration/outbox/outbox-constraints.test.ts`: cada guarda nova barra o dado inválido.
+   - `test/integration/pending-reference/worker.test.ts` (relógio controlado, sem sleeps): REFUND antes
+     da BET (202 → resolvido com a correlação original, replay 200); ROLLBACK antes do WIN; referência
+     que não bate (`AMOUNT_MISMATCH`); **limite de tentativas** com o cronograma exato até
+     `REFERENCE_NOT_FOUND` (replay 422); dois workers e a API na mesma wallet (tentativa contada uma
+     vez, sem deadlock); lock timeout sem gravar nada.
+   - `test/concurrency/outbox-publishers.test.ts` (processos `ROLE=outbox`): dois publishers com 200
+     eventos (cada evento enviado por uma instância só); a API confirma e morre, o publisher A morre
+     antes de a chamada chegar ao SQS e o B publica; A publica e morre antes do COMMIT, B publica de
+     novo: 2 cópias idênticas, e um consumidor com inbox por `eventId` aplica um efeito por evento.
+   - `test/concurrency/pending-reference-workers.test.ts` (2 processos `ROLE=pending-ref`): 20
+     reversões resolvidas e 10 sem referência rejeitadas com exatamente 3 tentativas (limite reduzido
+     no teste), com os eventos exatos.
+   - Unitários: `PublishOutbox` (falha parcial, entrada sem confirmação, broker fora) e `PollingWorker`.

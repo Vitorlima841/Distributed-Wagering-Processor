@@ -60,6 +60,7 @@ export class WagerTransactionRecord {
   nextAttemptAt!: Date | null;
   createdAt!: Date;
   processedAt!: Date | null;
+  correlationId!: string | null;
 }
 
 export const WagerTransactionSchema = new EntitySchema<WagerTransactionRecord>({
@@ -88,6 +89,7 @@ export const WagerTransactionSchema = new EntitySchema<WagerTransactionRecord>({
     nextAttemptAt: { ...timestamptz, nullable: true },
     createdAt: timestamptz,
     processedAt: { ...timestamptz, nullable: true },
+    correlationId: { type: 'text', nullable: true },
   },
 });
 
