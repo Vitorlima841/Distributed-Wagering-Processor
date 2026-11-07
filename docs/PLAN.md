@@ -116,12 +116,15 @@ Enunciado: `docs/CHALLENGE.md` · Regras: `CLAUDE.md` · Decisões: `ARCHITECTUR
       com a transação presa no COMMIT; `correlation_id` na transação; guarda da outbox no schema;
       `idle_in_transaction_session_timeout`; dois workers em processos (ver ARCHITECTURE §19)
 
-### Fase 8 — Observabilidade
-- [ ] Logger JSON com contexto (`correlationId` propagado do HTTP/SQS até o evento)
-- [ ] Métricas exigidas em `/metrics`
-- [ ] `/health/ready` checando Postgres e SQS
-- [ ] Reconciliação logando e contando divergências
-- [ ] Checar que nenhum log vaza payload financeiro completo
+### Fase 8 — Observabilidade ✅
+- [x] Logger JSON com contexto (`correlationId` propagado do HTTP/SQS até o evento)
+- [x] Métricas exigidas em `/metrics`
+- [x] `/health/ready` checando Postgres e SQS
+- [x] Reconciliação logando e contando divergências
+- [x] Checar que nenhum log vaza payload financeiro completo
+- [x] Extra: contexto de log por `AsyncLocalStorage` (o filtro de erros e o publisher herdam a
+      correlação), gauges de backlog lidos no scrape (outbox e DLQ, incluindo o redrive nativo),
+      readiness por papel e `shutting_down` no SIGTERM (ver ARCHITECTURE §10)
 
 ### Fase 9 — Documentação final + revisão
 - [ ] `README.md`: requisitos, setup, comandos, como rodar cada suíte de testes

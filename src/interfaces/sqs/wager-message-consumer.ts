@@ -4,8 +4,10 @@ import {
   type ProcessWagerTransaction,
   type WagerTransactionOutcome,
 } from '../../application';
+import { type LogContext, runWithLogContext } from '../../infrastructure/logging/log-context';
 import type { Logger } from '../../infrastructure/logging/logger';
 import { safeErrorFields } from '../../infrastructure/logging/safe-error-fields';
+import type { WageringMetrics } from '../../infrastructure/observability/metrics';
 import { type ConsumerDecision, decideForError, type RetryPolicy } from './consumer-decision';
 import { parseWagerMessage } from './wager-message';
 import type { QueueMessage, WagerQueue } from './wager-queue';
@@ -18,6 +20,8 @@ export interface WagerConsumerOptions {
   shutdownTimeoutMs: number;
   /** Pausa do loop depois de uma falha de infraestrutura (SQS ou banco fora do ar). */
   idleBackoff?: { initialMs: number; maxMs: number };
+  /** Resultados, retries e DLQ em `/metrics` (opcional nos testes unitários). */
+  metrics?: WageringMetrics;
 }
 
 type ProcessWager = Pick<ProcessWagerTransaction, 'execute'>;
@@ -162,13 +166,29 @@ export class WagerMessageConsumer {
     }
   }
 
-  private async handleMessage(tracked: Tracked, receivedAt: Date): Promise<ConsumerDecision> {
-    const { message } = tracked;
-    const startedAt = performance.now();
-    const context: Record<string, unknown> = {
-      sqsMessageId: message.sqsMessageId,
-      receiveCount: message.receiveCount,
+  /**
+   * Uma mensagem, dentro do próprio contexto de log: tudo o que for logado durante o processamento
+   * sai com `sqsMessageId` e, depois do parse, `messageId`, `correlationId`, `walletId` e
+   * `providerId`.
+   */
+  private handleMessage(tracked: Tracked, receivedAt: Date): Promise<ConsumerDecision> {
+    const context: LogContext = {
+      sqsMessageId: tracked.message.sqsMessageId,
+      receiveCount: tracked.message.receiveCount,
     };
+    return runWithLogContext(context, () => this.processMessage(tracked, receivedAt, context));
+  }
+
+  private async processMessage(
+    tracked: Tracked,
+    receivedAt: Date,
+    context: LogContext,
+  ): Promise<ConsumerDecision> {
+    const { message } = tracked;
+    const { metrics } = this.options;
+    const startedAt = performance.now();
+    const elapsed = () => (performance.now() - startedAt) / 1000;
+    let errorFields: Record<string, unknown> = {};
     let decision: ConsumerDecision;
     try {
       const parsed = parseWagerMessage(message.body);
@@ -185,13 +205,20 @@ export class WagerMessageConsumer {
         receivedAt,
       });
       Object.assign(context, outcomeFields(outcome));
+      metrics?.recordOutcome('sqs', parsed.command.kind, outcome, elapsed());
       decision = { action: 'ack' };
     } catch (error) {
       const classified = classifyError(error);
       decision = decideForError(classified, message.receiveCount, this.options.retry);
       Object.assign(context, { errorKind: classified.kind, errorCode: classified.code });
       if (classified.kind === 'invariant' || classified.kind === 'unknown') {
-        Object.assign(context, safeErrorFields(error));
+        errorFields = safeErrorFields(error);
+      }
+      metrics?.recordFailure('sqs', classified, elapsed());
+      if (decision.action === 'retry') {
+        metrics?.recordRetry('sqs_consumer', decision.code);
+      } else if (decision.action === 'dead-letter') {
+        metrics?.recordDeadLetter(decision.code);
       }
       if (classified.code === 'DATABASE_UNAVAILABLE') {
         this.infraFailureInBatch = true;
@@ -201,6 +228,7 @@ export class WagerMessageConsumer {
     const applied = await this.apply(tracked, decision);
     const fields = {
       ...context,
+      ...errorFields,
       decision: decision.action,
       ...(decision.action === 'retry' ? { delaySeconds: decision.delaySeconds } : {}),
       applied,
@@ -283,7 +311,7 @@ export class WagerMessageConsumer {
   }
 }
 
-function outcomeFields(outcome: WagerTransactionOutcome): Record<string, unknown> {
+function outcomeFields(outcome: WagerTransactionOutcome): LogContext {
   return {
     transactionId: outcome.transactionId,
     status: outcome.status,

@@ -50,6 +50,8 @@ const schema = z
     PENDING_REF_BATCH_SIZE: z.coerce.number().int().min(1).max(1000).default(100),
     PENDING_REF_POLL_INTERVAL_MS: z.coerce.number().int().min(10).default(1000),
     PENDING_REF_MAX_ATTEMPTS: z.coerce.number().int().min(1).max(100).default(10),
+    // prazo de cada dependência no GET /health/ready (ARCHITECTURE §10)
+    HEALTH_CHECK_TIMEOUT_MS: z.coerce.number().int().min(50).max(30_000).default(2000),
   })
   .refine((e) => e.SQS_RETRY_MAX_DELAY_S >= e.SQS_RETRY_BASE_DELAY_S, {
     path: ['SQS_RETRY_MAX_DELAY_S'],
@@ -84,6 +86,8 @@ export interface AppConfig {
   consumer: ConsumerConfig;
   outbox: OutboxConfig;
   pendingReference: PendingReferenceConfig;
+  /** Prazo de cada dependência checada pelo readiness. */
+  healthCheckTimeoutMs: number;
 }
 
 export interface OutboxConfig {
@@ -168,6 +172,7 @@ export function parseConfig(env: Record<string, string | undefined>): AppConfig 
       pollIntervalMs: e.PENDING_REF_POLL_INTERVAL_MS,
       maxAttempts: e.PENDING_REF_MAX_ATTEMPTS,
     },
+    healthCheckTimeoutMs: e.HEALTH_CHECK_TIMEOUT_MS,
   };
 }
 

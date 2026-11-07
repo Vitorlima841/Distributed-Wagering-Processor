@@ -27,7 +27,7 @@ export interface ReconciliationDivergence {
   checkedEntries: number;
 }
 
-/** Sinaliza divergências (log agora; métrica na fase 8). Nunca corrige nada. */
+/** Sinaliza divergências (log `warn` e métrica). Nunca corrige nada. */
 export interface ReconciliationMonitor {
   divergenceDetected(divergence: ReconciliationDivergence): void;
 }

@@ -11,6 +11,8 @@ import { APP_CONFIG, type AppConfig } from '../../infrastructure/config/app-conf
 import { LOGGER, type Logger } from '../../infrastructure/logging/logger';
 import { SQS_CLIENT } from '../../infrastructure/messaging/sqs-client';
 import { SqsWagerQueue } from '../../infrastructure/messaging/sqs-wager-queue';
+import { METRICS, type WageringMetrics } from '../../infrastructure/observability/metrics';
+import { errorCodeOf, withTimeout } from '../../infrastructure/observability/timeout';
 import { WagerMessageConsumer } from './wager-message-consumer';
 import { WAGER_QUEUE, type WagerQueue } from './wager-queue';
 
@@ -37,25 +39,39 @@ export class WagerConsumerLifecycle implements OnApplicationBootstrap, BeforeApp
   providers: [
     {
       provide: WAGER_QUEUE,
-      inject: [SQS_CLIENT, APP_CONFIG],
-      useFactory: (client: SQSClient, config: AppConfig) =>
-        new SqsWagerQueue(client, {
+      inject: [SQS_CLIENT, APP_CONFIG, METRICS, LOGGER],
+      useFactory: (
+        client: SQSClient,
+        config: AppConfig,
+        metrics: WageringMetrics,
+        logger: Logger,
+      ) => {
+        const queue = new SqsWagerQueue(client, {
           queueName: config.queues.wager,
           deadLetterQueueName: config.queues.wagerDlq,
           waitTimeSeconds: config.consumer.waitTimeSeconds,
           maxMessages: config.consumer.maxMessages,
           visibilityTimeoutS: config.consumer.visibilityTimeoutS,
-        }),
+        });
+        metrics.registerScrapeGauge(
+          'wagering_dlq_depth',
+          'Mensagens na DLQ de wager-transactions (visíveis + em voo), lidas do SQS no scrape; inclui o redrive nativo',
+          () => withTimeout(config.healthCheckTimeoutMs, (signal) => queue.deadLetterDepth(signal)),
+          (error) => logger.warn({ errorCode: errorCodeOf(error) }, 'dlq depth unavailable'),
+        );
+        return queue;
+      },
     },
     {
       provide: WagerMessageConsumer,
-      inject: [WAGER_QUEUE, ProcessWagerTransaction, CLOCK, LOGGER, APP_CONFIG],
+      inject: [WAGER_QUEUE, ProcessWagerTransaction, CLOCK, LOGGER, APP_CONFIG, METRICS],
       useFactory: (
         queue: WagerQueue,
         processWager: ProcessWagerTransaction,
         clock: Clock,
         logger: Logger,
         config: AppConfig,
+        metrics: WageringMetrics,
       ) =>
         new WagerMessageConsumer(queue, processWager, clock, logger, {
           consumerName: config.consumer.name,
@@ -64,6 +80,7 @@ export class WagerConsumerLifecycle implements OnApplicationBootstrap, BeforeApp
             maxDelayS: config.consumer.retryMaxDelayS,
           },
           shutdownTimeoutMs: config.consumer.shutdownTimeoutMs,
+          metrics,
         }),
     },
     WagerConsumerLifecycle,

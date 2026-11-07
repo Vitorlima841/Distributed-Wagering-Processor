@@ -1,8 +1,19 @@
+import type { OutboxMessage } from '../../domain';
 import type { Clock, EventPublisher, PublishFailure, UnitOfWork } from '../ports';
 
 export interface PublishOutboxOptions {
   /** Mensagens travadas e publicadas por ciclo (uma transação SQL por ciclo). */
   batchSize: number;
+}
+
+/** Metadados de um evento publicado neste ciclo (logs e outbox lag; sem o conteúdo do evento). */
+export interface PublishedEvent {
+  eventId: string;
+  eventType: string;
+  aggregateId: string;
+  correlationId?: string;
+  occurredAt: Date;
+  publishedAt: Date;
 }
 
 export interface PublishOutboxSummary {
@@ -11,8 +22,8 @@ export interface PublishOutboxSummary {
   published: number;
   /** Voltaram para a outbox com backoff (`scheduleRetry`). */
   failed: PublishFailure[];
-  /** `occurredAt` mais antigo entre as publicadas: base do outbox lag (fase 8). */
-  oldestPublishedOccurredAt?: Date;
+  /** As publicadas: `publishedAt − occurredAt` é o outbox lag de cada uma. */
+  publishedEvents: PublishedEvent[];
 }
 
 /**
@@ -43,7 +54,7 @@ export class PublishOutbox {
     return this.uow.run(async (scope) => {
       const due = await scope.outbox.claimDue(this.clock.now(), this.options.batchSize);
       if (due.length === 0) {
-        return { claimed: 0, published: 0, failed: [] };
+        return { claimed: 0, published: 0, failed: [], publishedEvents: [] };
       }
 
       let published: Set<string>;
@@ -62,13 +73,11 @@ export class PublishOutbox {
       }
 
       const now = this.clock.now();
-      let oldest: Date | undefined;
+      const publishedEvents: PublishedEvent[] = [];
       for (const message of due) {
         if (published.has(message.id)) {
           message.markPublished(now);
-          if (oldest === undefined || message.occurredAt < oldest) {
-            oldest = message.occurredAt;
-          }
+          publishedEvents.push(publishedEventOf(message, now));
         } else {
           message.scheduleRetry(now);
         }
@@ -78,10 +87,22 @@ export class PublishOutbox {
         claimed: due.length,
         published: due.length - failed.length,
         failed,
-        ...(oldest === undefined ? {} : { oldestPublishedOccurredAt: oldest }),
+        publishedEvents,
       };
     });
   }
+}
+
+function publishedEventOf(message: OutboxMessage, publishedAt: Date): PublishedEvent {
+  const { correlationId } = message.payload;
+  return {
+    eventId: message.id,
+    eventType: message.eventType,
+    aggregateId: message.aggregateId,
+    ...(typeof correlationId === 'string' ? { correlationId } : {}),
+    occurredAt: message.occurredAt,
+    publishedAt,
+  };
 }
 
 /** Só o nome/código do erro: a mensagem do SDK pode trazer o conteúdo enviado. */

@@ -66,7 +66,7 @@ describe('PublishOutbox', () => {
     const { uow } = fakeUow([]);
     const broker = publisher(async () => ({ published: [], failed: [] }));
     const summary = await new PublishOutbox(uow, broker, clock, { batchSize: 10 }).publishDue();
-    expect(summary).toEqual({ claimed: 0, published: 0, failed: [] });
+    expect(summary).toEqual({ claimed: 0, published: 0, failed: [], publishedEvents: [] });
     expect(broker.calls).toBe(0);
   });
 
@@ -87,7 +87,16 @@ describe('PublishOutbox', () => {
         { messageId: 'evt-1', reason: 'InvalidMessageContents' },
         { messageId: 'evt-2', reason: 'NOT_ACKNOWLEDGED' },
       ],
-      oldestPublishedOccurredAt: at(10),
+      publishedEvents: [
+        {
+          eventId: 'evt-0',
+          eventType: 'WagerTransactionProcessed',
+          aggregateId: due[0]?.aggregateId ?? '',
+          correlationId: 'corr',
+          occurredAt: at(10),
+          publishedAt: at(20),
+        },
+      ],
     });
     expect(saved.map((m) => m.id)).toEqual(['evt-0', 'evt-1', 'evt-2']);
     const [ok, refused, silent] = due;

@@ -1,4 +1,5 @@
 import type { SQSClient } from '@aws-sdk/client-sqs';
+import { MikroORM } from '@mikro-orm/postgresql';
 import {
   type BeforeApplicationShutdown,
   Inject,
@@ -20,10 +21,13 @@ import {
   type UnitOfWork,
 } from '../../application';
 import { APP_CONFIG, type AppConfig } from '../../infrastructure/config/app-config';
+import { OutboxBacklogReader } from '../../infrastructure/database/outbox-backlog-reader';
 import { LOGGER, type Logger } from '../../infrastructure/logging/logger';
 import { safeErrorFields } from '../../infrastructure/logging/safe-error-fields';
 import { SQS_CLIENT } from '../../infrastructure/messaging/sqs-client';
 import { SqsEventPublisher } from '../../infrastructure/messaging/sqs-event-publisher';
+import { METRICS, type WageringMetrics } from '../../infrastructure/observability/metrics';
+import { errorCodeOf, withTimeout } from '../../infrastructure/observability/timeout';
 import { PollingWorker } from './polling-worker';
 
 export const OUTBOX_WORKER = Symbol('OUTBOX_WORKER');
@@ -49,8 +53,17 @@ function workerLifecycle(token: symbol) {
   return WorkerLifecycle;
 }
 
-/** Ciclo do publisher: um lote por transação; falhas por mensagem voltam com backoff. */
-export function outboxCycle(publishOutbox: PublishOutbox, batchSize: number, logger: Logger) {
+/**
+ * Ciclo do publisher: um lote por transação; falhas por mensagem voltam com backoff. Cada evento
+ * publicado vira um log com o `correlationId` da requisição ou mensagem que o gerou (o fio
+ * HTTP/SQS → transação → evento) e uma amostra de `wagering_outbox_lag_seconds`.
+ */
+export function outboxCycle(
+  publishOutbox: PublishOutbox,
+  batchSize: number,
+  logger: Logger,
+  metrics: WageringMetrics,
+) {
   return async () => {
     const summary = await publishOutbox.publishDue();
     if (summary.claimed > 0) {
@@ -59,7 +72,22 @@ export function outboxCycle(publishOutbox: PublishOutbox, batchSize: number, log
         'outbox batch',
       );
     }
+    for (const event of summary.publishedEvents) {
+      const lagMs = event.publishedAt.getTime() - event.occurredAt.getTime();
+      metrics.recordEventPublished(event.eventType, lagMs / 1000);
+      logger.info(
+        {
+          eventId: event.eventId,
+          eventType: event.eventType,
+          aggregateId: event.aggregateId,
+          ...(event.correlationId ? { correlationId: event.correlationId } : {}),
+          lagMs,
+        },
+        'event published',
+      );
+    }
     for (const failure of summary.failed) {
+      metrics.recordPublishFailure(failure.reason);
       logger.warn(
         { eventId: failure.messageId, reason: failure.reason },
         'event publish failed; scheduled for retry',
@@ -74,6 +102,7 @@ export function pendingReferenceCycle(
   retry: RetryPendingReferences,
   batchSize: number,
   logger: Logger,
+  metrics: WageringMetrics,
 ) {
   return async () => {
     const summary = await retry.runOnce();
@@ -81,8 +110,16 @@ export function pendingReferenceCycle(
       if (result.outcome === 'SKIPPED') {
         continue;
       }
+      if (result.outcome === 'PENDING_REFERENCE') {
+        metrics.recordRetry('pending_reference', 'REFERENCE_NOT_FOUND');
+      } else {
+        metrics.recordResolution(result.kind, result.outcome);
+      }
       const fields = {
         transactionId: result.transactionId,
+        walletId: result.walletId,
+        correlationId: result.correlationId,
+        kind: result.kind,
         outcome: result.outcome,
         ...(result.outcome === 'REJECTED' ? { failureCode: result.failureCode } : {}),
         ...(result.outcome === 'PENDING_REFERENCE'
@@ -96,13 +133,53 @@ export function pendingReferenceCycle(
       }
     }
     for (const { transactionId, error } of summary.errors) {
+      const classified = classifyError(error);
+      metrics.recordFailure('pending_reference', classified);
+      metrics.recordRetry('pending_reference', classified.code);
       logger.warn(
-        { transactionId, code: classifyError(error).code, ...safeErrorFields(error) },
+        { transactionId, code: classified.code, ...safeErrorFields(error) },
         'pending reference retry failed; will retry next cycle',
       );
     }
     return { busy: summary.candidates >= batchSize };
   };
+}
+
+/**
+ * Gauges do backlog da outbox, lidos do banco a cada scrape (uma consulta para os dois). Mostram
+ * também o evento que o broker recusa para sempre: ele fica pendente e a idade só cresce.
+ */
+function registerOutboxBacklogGauges(
+  metrics: WageringMetrics,
+  reader: OutboxBacklogReader,
+  config: AppConfig,
+  logger: Logger,
+): void {
+  let last: { at: number; backlog: ReturnType<OutboxBacklogReader['read']> } | undefined;
+  // os dois gauges do mesmo scrape compartilham a leitura
+  const backlog = () => {
+    if (!last || performance.now() - last.at > 1000) {
+      last = {
+        at: performance.now(),
+        backlog: withTimeout(config.healthCheckTimeoutMs, () => reader.read()),
+      };
+    }
+    return last.backlog;
+  };
+  const onError = (error: unknown) =>
+    logger.warn({ errorCode: errorCodeOf(error) }, 'outbox backlog unavailable');
+  metrics.registerScrapeGauge(
+    'wagering_outbox_pending_messages',
+    'Eventos da outbox ainda não publicados (banco, lido no scrape)',
+    async () => (await backlog()).pending,
+    onError,
+  );
+  metrics.registerScrapeGauge(
+    'wagering_outbox_oldest_pending_age_seconds',
+    'Idade do evento não publicado mais antigo (0 sem backlog): o outbox lag atual',
+    async () => (await backlog()).oldestAgeSeconds,
+    onError,
+  );
 }
 
 /** Papel `outbox`: publica `outbox_messages` em `wagering-events` (ARCHITECTURE §9 e §19). */
@@ -125,12 +202,19 @@ export function pendingReferenceCycle(
     },
     {
       provide: OUTBOX_WORKER,
-      inject: [PublishOutbox, LOGGER, APP_CONFIG],
-      useFactory: (publishOutbox: PublishOutbox, logger: Logger, config: AppConfig) => {
+      inject: [PublishOutbox, LOGGER, APP_CONFIG, METRICS, MikroORM],
+      useFactory: (
+        publishOutbox: PublishOutbox,
+        logger: Logger,
+        config: AppConfig,
+        metrics: WageringMetrics,
+        orm: MikroORM,
+      ) => {
         const workerLogger = logger.child({ component: 'outbox-publisher' });
+        registerOutboxBacklogGauges(metrics, new OutboxBacklogReader(orm), config, workerLogger);
         return new PollingWorker(
           'outbox-publisher',
-          outboxCycle(publishOutbox, config.outbox.batchSize, workerLogger),
+          outboxCycle(publishOutbox, config.outbox.batchSize, workerLogger, metrics),
           workerLogger,
           { pollIntervalMs: config.outbox.pollIntervalMs },
         );
@@ -156,12 +240,17 @@ export class OutboxModule {}
     },
     {
       provide: PENDING_REFERENCE_WORKER,
-      inject: [RetryPendingReferences, LOGGER, APP_CONFIG],
-      useFactory: (retry: RetryPendingReferences, logger: Logger, config: AppConfig) => {
+      inject: [RetryPendingReferences, LOGGER, APP_CONFIG, METRICS],
+      useFactory: (
+        retry: RetryPendingReferences,
+        logger: Logger,
+        config: AppConfig,
+        metrics: WageringMetrics,
+      ) => {
         const workerLogger = logger.child({ component: 'pending-reference-worker' });
         return new PollingWorker(
           'pending-reference-worker',
-          pendingReferenceCycle(retry, config.pendingReference.batchSize, workerLogger),
+          pendingReferenceCycle(retry, config.pendingReference.batchSize, workerLogger, metrics),
           workerLogger,
           { pollIntervalMs: config.pendingReference.pollIntervalMs },
         );

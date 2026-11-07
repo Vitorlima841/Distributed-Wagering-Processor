@@ -136,7 +136,11 @@ describe('worker de PENDING_REFERENCE (Postgres real)', () => {
       expect(bet.res.body.balance.amount).toBe('75.00');
 
       const outcome = await attemptWhenDue(refundId);
-      expect(outcome).toEqual({ transactionId: refundId, outcome: 'PROCESSED' });
+      expect(outcome).toMatchObject({
+        transactionId: refundId,
+        kind: 'REFUND',
+        outcome: 'PROCESSED',
+      });
 
       const state = await transactionState(db.orm, refundId);
       expect(state).toMatchObject({
@@ -202,7 +206,7 @@ describe('worker de PENDING_REFERENCE (Postgres real)', () => {
       });
       expect(win.res.body.balance.amount).toBe('80.00');
 
-      expect(await attemptWhenDue(rollbackId)).toEqual({
+      expect(await attemptWhenDue(rollbackId)).toMatchObject({
         transactionId: rollbackId,
         outcome: 'PROCESSED',
       });
@@ -230,7 +234,7 @@ describe('worker de PENDING_REFERENCE (Postgres real)', () => {
       const refundId: string = refund.res.body.transactionId;
       await send(wallet, { kind: 'BET', amount: '20.00', externalTransactionId: betExternalId });
 
-      expect(await attemptWhenDue(refundId)).toEqual({
+      expect(await attemptWhenDue(refundId)).toMatchObject({
         transactionId: refundId,
         outcome: 'REJECTED',
         failureCode: FailureCode.AmountMismatch,
@@ -272,7 +276,7 @@ describe('worker de PENDING_REFERENCE (Postgres real)', () => {
       expect(gaps).toEqual([2, 4, 8, 16, 32, 60, 60, 60, 60]);
 
       const last = await attemptWhenDue(refundId);
-      expect(last).toEqual({
+      expect(last).toMatchObject({
         transactionId: refundId,
         outcome: 'REJECTED',
         failureCode: FailureCode.ReferenceNotFound,
@@ -355,7 +359,7 @@ describe('worker de PENDING_REFERENCE (Postgres real)', () => {
 
       // a referência chega e o próximo ciclo resolve
       await send(wallet, { kind: 'BET', amount: '5.00', externalTransactionId: betExternalId });
-      expect(await attemptWhenDue(refundId)).toEqual({
+      expect(await attemptWhenDue(refundId)).toMatchObject({
         transactionId: refundId,
         outcome: 'PROCESSED',
       });

@@ -1,6 +1,7 @@
 import {
   ChangeMessageVisibilityCommand,
   DeleteMessageCommand,
+  GetQueueAttributesCommand,
   GetQueueUrlCommand,
   type Message,
   ReceiveMessageCommand,
@@ -112,6 +113,25 @@ export class SqsWagerQueue implements WagerQueue {
     );
     await this.client.send(
       new DeleteMessageCommand({ QueueUrl: main, ReceiptHandle: message.receiptHandle }),
+    );
+  }
+
+  /**
+   * Mensagens na DLQ (visíveis + em voo), para o gauge `wagering_dlq_depth`. Conta também as que
+   * o redrive nativo do SQS moveu, que o consumer nunca vê. Valor aproximado (atributo do SQS).
+   */
+  async deadLetterDepth(signal?: AbortSignal): Promise<number> {
+    const { deadLetter } = await this.queueUrls();
+    const { Attributes } = await this.client.send(
+      new GetQueueAttributesCommand({
+        QueueUrl: deadLetter,
+        AttributeNames: ['ApproximateNumberOfMessages', 'ApproximateNumberOfMessagesNotVisible'],
+      }),
+      signal ? { abortSignal: signal } : {},
+    );
+    return (
+      Number(Attributes?.ApproximateNumberOfMessages ?? 0) +
+      Number(Attributes?.ApproximateNumberOfMessagesNotVisible ?? 0)
     );
   }
 

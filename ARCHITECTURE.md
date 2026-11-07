@@ -251,10 +251,111 @@ O replay de uma transação que estava PENDING_REFERENCE e já foi resolvida dev
 
 ## 10. Observabilidade
 
-- Logs JSON (pino) com `correlationId`, `messageId`, `transactionId`, `walletId`, `providerId`.
-- Métricas Prometheus (`prom-client`) em `/metrics`: transações por status, duplicatas, retries, DLQ,
-  conflitos/timeout de lock, outbox lag e latência de processamento.
-- `GET /health/live` (processo vivo) e `GET /health/ready` (Postgres e SQS), sem autenticação.
+Fase 8. Código em `src/infrastructure/logging/` e `src/infrastructure/observability/`; o registro
+acontece nas bordas (`interfaces`: controller, middleware HTTP, consumer, ciclos dos workers). O domínio
+não sabe de nada disso. A `application` só passou a devolver um pouco mais de dados: os metadados dos
+eventos publicados no resumo do `PublishOutbox` e `walletId`/`kind`/`correlationId` nos resultados do
+worker de PENDING_REFERENCE. O `ReconciliationMonitor`, que já era um port, ganhou o contador.
+
+**Logs** (pino, JSON, uma linha por evento, stdout)
+
+- **Contexto por unidade de trabalho** (`log-context.ts`): um `AsyncLocalStorage` guarda os campos da
+  requisição ou da mensagem, e o `mixin` do pino os junta a cada linha. Quem loga dentro dela (inclusive
+  o filtro de erros) não precisa repassar nada. Os campos do próprio log têm precedência.
+- **HTTP**: o `RequestContextMiddleware` (primeira coisa de toda rota, inclusive 404) resolve o
+  `correlationId` (o `X-Correlation-Id` do cliente, se válido, senão um UUID novo, devolvido no header)
+  e abre o contexto. O `POST /wagering/transactions` acrescenta `walletId`, `providerId` e `kind` e,
+  depois do processamento, `transactionId`, `status` e `idempotentReplay`. No fim da resposta sai
+  `request completed` com `method`, `route` (o modelo, ex. `/wallets/:walletId`, nunca a URL: a query
+  pode trazer cursor), `statusCode` e `durationMs`. `/health/*` e `/metrics` logam em `debug`.
+- **SQS**: cada mensagem roda no próprio contexto: `sqsMessageId` e `receiveCount`, depois do parse
+  `messageId` (do envelope), `correlationId`, `walletId` e `providerId`. O log final traz também
+  `transactionId`, `status`, `duplicateDelivery`, `decision` (ack/retry/dead-letter) e `durationMs`.
+- **Até o evento**: o `correlationId` vai no comando → `wager_transactions.correlation_id` → envelope do
+  evento na outbox. O publisher loga cada evento publicado (`event published`, com `eventId`,
+  `eventType`, `aggregateId`, `correlationId` e `lagMs`), e o worker de PENDING_REFERENCE loga com a
+  correlação original da transação.
+- **Nunca entram**: valores em dinheiro, saldos, o corpo da requisição ou o payload do evento, nem a
+  mensagem de erro do driver (traz o SQL com os parâmetros; `safe-error-fields.ts`). A única exceção é a
+  `difference` da divergência de reconciliação, que é o dado a investigar. O teste de observabilidade
+  roda em `debug` e procura nas linhas os valores e saldos de todas as transações do cenário.
+
+Amostra real (um BET por HTTP e um WIN pela fila; ids encurtados só aqui):
+
+```json
+{"level":30,"time":"2026-11-07T02:55:10.981Z","correlationId":"req-7f3a","walletId":"01a1b3ee-721f-…","providerId":"provider-a","kind":"BET","transactionId":"01a1b3ee-725f-…","status":"PROCESSED","idempotentReplay":false,"method":"POST","route":"/wagering/transactions","statusCode":201,"durationMs":41,"msg":"request completed"}
+{"level":30,"time":"2026-11-07T02:55:11.026Z","component":"sqs-consumer","consumer":"consumer-t1770023de2","sqsMessageId":"8263d2ab-…","receiveCount":1,"messageId":"msg-0001","correlationId":"msg-c41d","walletId":"01a1b3ee-721f-…","providerId":"provider-a","transactionId":"01a1b3ee-728f-…","status":"PROCESSED","idempotentReplay":false,"duplicateDelivery":false,"decision":"ack","applied":true,"durationMs":37,"msg":"message processed"}
+{"level":30,"time":"2026-11-07T02:55:11.070Z","component":"outbox-publisher","eventId":"01a1b3ee-7273-…","eventType":"WagerTransactionProcessed","aggregateId":"01a1b3ee-725f-…","correlationId":"req-7f3a","lagMs":123,"msg":"event published"}
+{"level":30,"time":"2026-11-07T02:55:11.070Z","component":"outbox-publisher","eventId":"01a1b3ee-72a2-…","eventType":"WalletBalanceChanged","aggregateId":"01a1b3ee-721f-…","correlationId":"msg-c41d","lagMs":75,"msg":"event published"}
+```
+
+**Métricas** (`prom-client`, `GET /metrics` em todos os papéis, sem autenticação)
+
+| Métrica | Tipo | Labels | Registrada em |
+|---|---|---|---|
+| `wagering_transactions_total` | counter | `source` (http/sqs/pending_reference), `kind`, `status` | decisão nova: HTTP, consumer e o worker (resolução de PENDING_REFERENCE) |
+| `wagering_duplicates_total` | counter | `source`, `type` (idempotent_replay/duplicate_delivery) | replay pela Idempotency-Key; reentrega que a inbox barrou |
+| `wagering_transaction_errors_total` | counter | `source`, `kind`, `code` | processamento que lançou (rollback): validação, conflito, lock, banco fora |
+| `wagering_lock_failures_total` | counter | `source`, `code` (LOCK_TIMEOUT/LOCK_CONFLICT) | `lock_timeout` e deadlock/serialização |
+| `wagering_retries_total` | counter | `component` (sqs_consumer/outbox_publisher/pending_reference), `reason` | toda nova tentativa agendada |
+| `wagering_dlq_messages_total` | counter | `code` | mensagem que o consumer mandou para a DLQ (erro permanente) |
+| `wagering_dlq_depth` | gauge | | DLQ no SQS (visíveis + em voo), lida no scrape (papel consumer) |
+| `wagering_processing_duration_seconds` | histogram | `source`, `result` (status, idempotent_replay, duplicate_delivery, error) | validação + transação SQL + COMMIT (HTTP e consumer) |
+| `wagering_outbox_events_published_total` | counter | `event_type` | eventos aceitos pelo broker |
+| `wagering_outbox_publish_failures_total` | counter | `reason` | eventos recusados (voltam com backoff) |
+| `wagering_outbox_lag_seconds` | histogram | | `publishedAt − occurredAt` de cada evento publicado |
+| `wagering_outbox_pending_messages` | gauge | | eventos não publicados, lidos do banco no scrape (papel outbox) |
+| `wagering_outbox_oldest_pending_age_seconds` | gauge | | idade do não publicado mais antigo: o lag atual (papel outbox) |
+| `wagering_reconciliation_divergences_total` | counter | | reconciliação com `consistent: false` |
+| `wagering_http_request_duration_seconds` | histogram | `method`, `route`, `status` | toda requisição HTTP |
+| `wagering_metric_collect_failures_total` | counter | `gauge` | gauge de backlog que não pôde ser lido no scrape |
+
+- **Por processo e sem garantia nenhuma**: contadores e histogramas vivem na memória do processo e
+  zeram no reinício; quem soma as réplicas é o Prometheus. Nada de correção depende deles.
+- **Labels de conjunto fechado**: status, códigos de erro, tipo de evento, rota modelo. Nunca ids (a
+  cardinalidade explodiria). Um `kind` desconhecido vira `OTHER`.
+- **"Transações por status" conta decisões novas.** Replays e reentregas vão para
+  `wagering_duplicates_total`, então somar os dois não conta duas vezes a mesma transação.
+- **DLQ em duas fontes**: o contador vê só o que o consumer mandou na hora. O redrive nativo (5
+  recebimentos) não passa pelo código, e por isso existe o gauge `wagering_dlq_depth`.
+- **Outbox lag em duas formas**: o histograma mede o atraso de cada evento publicado; o gauge da idade
+  do mais antigo pendente mostra um backlog parado (inclusive o evento que o SQS recusa para sempre,
+  seção 12) mesmo quando nada está sendo publicado.
+- **Gauges lidos no scrape** (backlog da outbox e profundidade da DLQ) são globais: réplicas do mesmo
+  papel reportam o mesmo número. Só o papel responsável os expõe, com o prazo de
+  `HEALTH_CHECK_TIMEOUT_MS`. Falha na leitura → `NaN` + `wagering_metric_collect_failures_total` +
+  log `warn` (zero esconderia o problema).
+- **Sem `collectDefaultMetrics`**: no Bun 1.4 a métrica de event loop lag do `prom-client` sai
+  quebrada (`min` 9e9, `mean` NaN). CPU e memória do processo ficam para o runtime/orquestrador.
+
+**Health checks** (sem autenticação, fora do `ProviderAuthGuard`)
+
+- `GET /health/live`: o processo está de pé. Não toca em dependências (banco fora não deve reiniciar o
+  processo).
+- `GET /health/ready`: checa na hora, em paralelo e com prazo (`HEALTH_CHECK_TIMEOUT_MS`, padrão 2s), as
+  dependências do papel. 200 `{ status: "ready", checks }` ou 503 `not_ready`; cada check traz
+  `status` (up/down), `durationMs` e, se caiu, só o código do erro.
+
+| Papel | Postgres (`SELECT 1`) | SQS (`GetQueueUrl`) |
+|---|---|---|
+| `api`, `pending-ref` | sim | não usam SQS: um SQS fora do ar não os impede de trabalhar |
+| `consumer` | sim | `wager-transactions.fifo` e a DLQ |
+| `outbox` | sim | `wagering-events` |
+| `all` | sim | as três |
+
+- **Shutdown**: assim que o `app.close()` começa (SIGTERM, `onModuleDestroy`), o readiness responde 503
+  `shutting_down` sem checar nada. O HTTP só fecha depois que o consumer e os workers terminam o que
+  estão fazendo, então o balanceador para de mandar tráfego durante a drenagem.
+
+**Testes** (Postgres e LocalStack reais)
+
+- `test/integration/observability/observability.test.ts`: um processo `ROLE=all` passa por transação
+  nova, replay, conflito de idempotência, lock timeout no HTTP (503) e no consumer (retry), reentrega,
+  mensagem malformada (DLQ), PENDING_REFERENCE, reconciliação divergente e publicação da outbox. O teste
+  confere cada métrica no `/metrics`, os campos de contexto nas linhas de log capturadas e que nenhuma
+  linha traz valores ou saldos. Termina com `wallet.balance == saldo reconstruído pelo ledger`.
+- `test/integration/health.test.ts`: liveness, readiness 200; 503 com o banco apagado (`DROP DATABASE
+  … WITH (FORCE)`); 503 com o SQS numa porta morta; 503 `shutting_down` durante o `app.close()`.
 
 ## 11. Autenticação
 
@@ -307,13 +408,23 @@ wallet e reconciliação exigiriam um papel de backoffice.
     Só publishers disputam essas linhas, e eles as pulam; o custo é uma transação aberta pelo tempo
     da chamada.
   - Um evento que o SQS recusa sempre (ex.: maior que 256 KB, longe do tamanho dos envelopes atuais)
-    fica em retry a cada 60s para sempre, com log `warn`; a métrica entra na fase 8.
+    fica em retry a cada 60s para sempre, com log `warn`. Aparece em
+    `wagering_outbox_publish_failures_total` e na idade de `wagering_outbox_oldest_pending_age_seconds`,
+    que só cresce (seção 10).
   - Uma reversão rejeitada com `REFERENCE_NOT_FOUND` é terminal: se a referência chegar depois, a
     reversão não volta sozinha, e o provedor precisa reenviá-la com outro id (`fix_payload`).
   - O worker não é acordado pela chegada da referência: a reversão espera a próxima tentativa
     agendada (até 60s depois das primeiras tentativas).
   - Transações gravadas antes da migration da fase 7 não têm `correlation_id`; os eventos do worker
     para elas usam o id da transação como correlação.
+- **Observabilidade** (seção 10):
+  - Contadores e histogramas são por processo e zeram no reinício: o que um processo contou depois do
+    último scrape se perde com ele.
+  - O retry interno da corrida residual de unicidade (seção 5) não aparece nas métricas; só a segunda
+    colisão seguida vira erro (`CONCURRENT_CONFLICT`).
+  - `/metrics` e `/health/*` não têm autenticação; em produção ficariam numa porta ou rede interna.
+  - Cada scrape de uma réplica `outbox` faz uma consulta à outbox, e de uma `consumer` uma chamada
+    `GetQueueAttributes` ao SQS.
 
 ## 13. Decisões da fase 1 (scaffolding)
 
@@ -324,7 +435,7 @@ wallet e reconciliação exigiriam um papel de backoffice.
   `migrationsList` explícita, para não depender de glob de arquivos sob Bun. `EntitySchema` na fase 3.
   Não usamos `@mikro-orm/nestjs`: o provider de `MikroORM` é próprio (`DatabaseModule`).
 - **Config**: `zod` valida o ambiente em `parseConfig`; falha na inicialização listando os campos inválidos.
-- **Todos os papéis expõem HTTP** (health, futuramente `/metrics`), inclusive consumer/outbox/pending-ref.
+- **Todos os papéis expõem HTTP** (health e `/metrics`), inclusive consumer/outbox/pending-ref.
   Isso mantém o processo vivo e permite liveness/readiness por papel.
 - **Lint**: Biome.
 - **LocalStack**: imagem fixada em `3.8` (comunitária, sem `LOCALSTACK_AUTH_TOKEN`). As filas são criadas por
@@ -479,7 +590,7 @@ Interpretações do enunciado e escolhas de modelagem, todas cobertas por testes
    saldo, soma de CREDIT, soma de DEBIT e contagem. `calculated = créditos − débitos` e `difference =
    stored − calculated` em `Money` (podem ser negativos). Divergência vai para a resposta
    (`consistent: false`) e para o `ReconciliationMonitor` (log `warn` com wallet, diferença e
-   contagem; métrica na fase 8). Nunca corrige nada.
+   contagem, e `wagering_reconciliation_divergences_total`, seção 10). Nunca corrige nada.
 9. **Sem retry interno de erro transitório:** lock timeout ou conexão perdida viram 503 com
    `Retry-After: 1`; o provedor repete com a mesma key. O único retry interno é o da corrida residual de
    unicidade (seção 5), limitado a uma tentativa extra.

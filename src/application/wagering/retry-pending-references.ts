@@ -9,10 +9,23 @@ export interface RetryPendingReferencesOptions {
   maxAttempts?: number;
 }
 
+/** Identificação de uma transação tratada pelo worker (logs e métricas). */
+export interface PendingReferenceRetried {
+  transactionId: string;
+  walletId: string;
+  kind: string;
+  /** Correlação da requisição ou mensagem original (o id da transação, se for anterior à coluna). */
+  correlationId: string;
+}
+
 export type PendingReferenceRetryOutcome =
-  | { transactionId: string; outcome: 'PROCESSED' }
-  | { transactionId: string; outcome: 'REJECTED'; failureCode: FailureCode }
-  | { transactionId: string; outcome: 'PENDING_REFERENCE'; attempts: number; nextAttemptAt: Date }
+  | (PendingReferenceRetried & { outcome: 'PROCESSED' })
+  | (PendingReferenceRetried & { outcome: 'REJECTED'; failureCode: FailureCode })
+  | (PendingReferenceRetried & {
+      outcome: 'PENDING_REFERENCE';
+      attempts: number;
+      nextAttemptAt: Date;
+    })
   /** Outro worker (ou o próprio relógio) já tirou a transação da fila depois da leitura. */
   | { transactionId: string; outcome: 'SKIPPED' };
 
@@ -88,23 +101,30 @@ export class RetryPendingReferences {
       if (!wallet || !tx || tx.walletId !== wallet.id || !tx.isReferenceRetryDue(now)) {
         return { transactionId, outcome: 'SKIPPED' };
       }
+      // a correlação da requisição original; transações anteriores à coluna usam o próprio id
+      const correlationId = tx.correlationId ?? tx.id;
       const result = await applyWager(scope, this.ids, {
         wallet,
         transaction: tx,
         isNew: false,
         now,
-        // a correlação da requisição original; transações anteriores à coluna usam o próprio id
-        correlation: { correlationId: tx.correlationId ?? tx.id },
+        correlation: { correlationId },
         maxReferenceAttempts: this.maxAttempts,
       });
+      const retried: PendingReferenceRetried = {
+        transactionId,
+        walletId: wallet.id,
+        kind: tx.kind,
+        correlationId,
+      };
       switch (result.outcome) {
         case 'PROCESSED':
-          return { transactionId, outcome: 'PROCESSED' };
+          return { ...retried, outcome: 'PROCESSED' };
         case 'REJECTED':
-          return { transactionId, outcome: 'REJECTED', failureCode: result.failureCode };
+          return { ...retried, outcome: 'REJECTED', failureCode: result.failureCode };
         case 'PENDING_REFERENCE':
           return {
-            transactionId,
+            ...retried,
             outcome: 'PENDING_REFERENCE',
             attempts: tx.referenceAttempts,
             nextAttemptAt: tx.nextAttemptAt ?? now,

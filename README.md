@@ -6,9 +6,10 @@ provedores. NestJS + Bun + TypeScript estrito + MikroORM + PostgreSQL + SQS (Loc
 Enunciado: [docs/CHALLENGE.md](docs/CHALLENGE.md) · Plano: [docs/PLAN.md](docs/PLAN.md) ·
 Decisões: [ARCHITECTURE.md](ARCHITECTURE.md)
 
-> Estado atual: **fase 7** (domínio, persistência, use cases, API HTTP, suíte de concorrência,
+> Estado atual: **fase 8** (domínio, persistência, use cases, API HTTP, suíte de concorrência,
 > consumer SQS com inbox, retry/DLQ e shutdown gracioso, outbox publisher e worker de
-> PENDING_REFERENCE). Observabilidade (fase 8) ainda não.
+> PENDING_REFERENCE e observabilidade: logs JSON com correlação, `/metrics`,
+> `/health/ready`).
 
 ## Requisitos
 
