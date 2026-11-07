@@ -127,11 +127,13 @@ Enunciado: `docs/CHALLENGE.md` · Regras: `CLAUDE.md` · Decisões: `ARCHITECTUR
       readiness por papel e `shutting_down` no SIGTERM (ver ARCHITECTURE §10)
 
 ### Fase 9 — Documentação final + revisão
-- [ ] `README.md`: requisitos, setup, comandos, como rodar cada suíte de testes
-- [ ] `ARCHITECTURE.md` final: decisões, trade-offs e limitações
+- [x] `README.md`: requisitos, setup, comandos, como rodar cada suíte de testes
+- [x] `ARCHITECTURE.md` final: decisões, trade-offs e limitações (§12), desenho de autenticação (§11)
 - [ ] `/code-review` e correção dos achados
-- [ ] Conferir item a item as falhas eliminatórias e a tabela de avaliação
-- [ ] (Opcional) `bun run test:load`
+- [x] Conferir item a item as falhas eliminatórias e a tabela de avaliação (`docs/AUDIT.md`)
+- [ ] (Opcional) `bun run test:load`: não feito, registrado em ARCHITECTURE §12 e no AUDIT
+- [x] Clone limpo seguindo só o README: stack do zero (`--build`, volume novo), exemplos da API e
+      da fila, e as três suítes rodando a partir do clone (ARCHITECTURE §20)
 
 ---
 

@@ -1,5 +1,30 @@
 # ARCHITECTURE.md
 
+Decisões técnicas do Distributed Wagering Processor. Setup e comandos: [README.md](README.md).
+Conferência contra o desafio (falhas eliminatórias, testes obrigatórios e tabela de avaliação, com as
+evidências): [docs/AUDIT.md](docs/AUDIT.md).
+
+Como ler:
+
+- **§1–12 descrevem o sistema como ele é hoje**: camadas, dinheiro, concorrência, idempotência, schema,
+  regras, HTTP, mensageria, observabilidade, autenticação e, na §12, os **trade-offs e limitações**.
+- **§13–20 são o registro das decisões de cada fase**: o porquê de cada escolha, as alternativas
+  descartadas, os achados durante os testes e o que cada teste prova. As §1–12 apontam para elas.
+
+| Tema | Seção | Detalhe por fase |
+|---|---|---|
+| Camadas e papéis | §1, §2 | §13 |
+| `Money` | §3 | §14.3 |
+| Concorrência (lock por wallet) e por que é correta | §4 | §15.7–8, §17 |
+| Idempotência e hash do payload | §5 | §14.4, §16 |
+| Schema, constraints e triggers | §6 | §15 |
+| Regras de negócio e `failureCode` | §7 | §14 |
+| Mapeamento HTTP | §8 | §16 |
+| Consumer SQS, outbox, PENDING_REFERENCE | §9 | §18, §19 |
+| Observabilidade | §10 | — |
+| Autenticação (não implementada) | §11 | — |
+| Trade-offs e limitações | §12 | — |
+
 ## 1. Visão geral
 
 Um único serviço NestJS (TypeScript estrito, rodando em Bun) organizado em **arquitetura hexagonal**.
@@ -14,8 +39,8 @@ A mesma imagem roda em vários **papéis**, escolhidos por variável de ambiente
 
 `ROLE=all` liga tudo (útil em dev). A correção com múltiplas instâncias é provada pela suíte de
 concorrência, que sobe **3 processos reais** da aplicação contra o mesmo Postgres (seção 17). O docker
-compose roda uma instância; um perfil com réplicas atrás de um balanceador, para demonstração manual,
-fica para a fase 9.
+compose roda uma instância só: um perfil com réplicas atrás de um balanceador não foi feito, porque não
+provaria nada além do que a suíte já prova, e nela o teste controla qual instância cai e quando (§17.1).
 
 ```
               HTTP  ─┐                            ┌─> wallets (FOR UPDATE)
@@ -359,14 +384,88 @@ Amostra real (um BET por HTTP e um WIN pela fila; ids encurtados só aqui):
 
 ## 11. Autenticação
 
-Fora do escopo de pontuação. O ponto de extensão é o `ProviderAuthGuard` no-op
-(`src/interfaces/http/provider-auth.guard.ts`), aplicado aos controllers de negócio; health fica fora.
-Desenho que adotaríamos: Keycloak/OIDC, `client_credentials` por provedor; o guard valida o JWT
-(JWKS, `iss`, `aud`, `exp`), extrai o `providerId` de uma claim e exige que ele bata com o do corpo
-(`POST /wagering/transactions`) ou do path (`GET /providers/:providerId/...`), senão 403. Rotas de
-wallet e reconciliação exigiriam um papel de backoffice.
+**Decisão: não implementada.** O desafio permite (seção 2: não vale pontos), e o tempo foi para correção
+financeira, concorrência e idempotência. **Hoje qualquer cliente que alcance a API pode criar wallets e
+submeter transações em nome de qualquer provedor.** O que existe é o ponto de extensão.
 
-## 12. Limitações e trade-offs conhecidos
+**Ponto de extensão no código**
+
+- `ProviderAuthGuard` (`src/interfaces/http/provider-auth.guard.ts`): `CanActivate` que hoje devolve
+  `true`. É aplicado com `@UseGuards` nos dois controllers de negócio (`WalletsController` e
+  `WageringController`) e só existe no `ApiModule` (papéis `api` e `all`).
+- Ficam fora do guard, como o desafio pede: `GET /health/live`, `GET /health/ready` e `GET /metrics`
+  (`HealthController` e `MetricsController` no `HttpModule`, presente em todos os papéis).
+- O consumer SQS não passa pelo guard: a fila é canal interno confiável. O `providerId` da mensagem
+  continua sujeito às mesmas validações de domínio do HTTP (`src/interfaces/contracts`), inclusive a
+  recusa de `providerId = 'internal'`.
+
+**Desenho que adotaríamos**
+
+1. **IdP externo:** Keycloak (OIDC) num serviço a mais do docker compose, com um realm importado na
+   inicialização. Sem tabela de usuários nem hash de senha no serviço.
+2. **Provedores são máquinas:** um client confidencial por provedor, com o fluxo `client_credentials`.
+   O provedor pede o token ao Keycloak e manda `Authorization: Bearer <jwt>`. Um *protocol mapper*
+   coloca o `providerId` numa claim (por exemplo `provider_id`). Operadores de backoffice usam o fluxo
+   `authorization_code` com um papel `backoffice`.
+3. **Validação no guard** (sem chamar o IdP a cada requisição):
+   - assinatura pelo JWKS do realm, com cache das chaves e nova busca quando aparecer um `kid`
+     desconhecido (rotação de chave);
+   - `iss` igual ao realm, `aud` igual ao client da API, `exp`/`nbf` com folga pequena de relógio;
+   - token ausente ou inválido → 401; token válido sem permissão → 403. Os dois usariam o envelope de
+     erro único, com códigos novos (`UNAUTHENTICATED`, `FORBIDDEN`).
+4. **Autorização:**
+
+   | Rota | Regra |
+   |---|---|
+   | `POST /wagering/transactions` | `provider_id` do token == `providerId` do corpo |
+   | `GET /providers/:providerId/wagering/transactions/:id` | `provider_id` do token == `:providerId` |
+   | `GET /wagering/transactions/:id` | a transação precisa ser do provedor do token (senão 404, para não revelar a existência) |
+   | `POST /wallets`, `GET /wallets/*`, `POST /wallets/:id/reconciliation` | papel `backoffice` |
+   | `/health/*`, `/metrics` | abertas (em produção, numa porta ou rede interna) |
+
+5. **Onde o código mudaria:** só a borda. O guard ganharia a validação acima e poria a identidade
+   (`providerId`, papéis) no request e no contexto de log (`log-context.ts`). Os controllers comparariam
+   a identidade com o corpo e o path. `ProcessWagerTransaction` e o domínio não mudam: a identidade do
+   provedor já é um campo validado do comando, e a idempotência já é por provedor
+   (`ux_wager_tx_provider_external`).
+6. **Se precisar autenticar a fila também:** IAM/políticas da própria fila SQS (quem pode publicar), e
+   não JWT na mensagem.
+
+**Por que não `ProviderIdentityPort` na `application`:** a regra "o provedor do token tem que ser o do
+payload" é de borda (transporte HTTP). O use case já recebe um `providerId` validado, e a fila não tem
+token. Se um dia a regra depender de dados do banco (por exemplo, provedor desativado), aí sim ela vira
+um port.
+
+## 12. Limitações e trade-offs
+
+### Trade-offs principais
+
+| Escolha | Ganho | Custo aceito | Alternativa descartada |
+|---|---|---|---|
+| Lock pessimista por wallet (`FOR UPDATE`), §4 | Correto com N instâncias e fácil de provar; sem retries numa hot wallet | Uma wallet processa uma transação por vez; a espera é limitada por `lock_timeout` (503) | Optimistic locking com `version`: numa wallet disputada vira uma fila de retries |
+| Garantias duplicadas no schema (CHECKs, índices, triggers diferidos), §6 e §15 | Um bug no código não confirma estado inválido | Duas ou três buscas por índice a cada COMMIT que mexe em saldo; schema mais complexo | Garantias só no código (proibido pela restrição 9) |
+| READ COMMITTED + `FOR UPDATE`, §15.7 | Quem pega o lock lê o último saldo confirmado | Depende de todo caminho de escrita travar a wallet (o repositório e o trigger `tg_wallets_guard_update` exigem isso) | REPEATABLE READ: erro de serialização a cada disputa |
+| Rejeição de negócio como resultado, não exceção, §16.2 | O REJECTED fica auditado no mesmo COMMIT | O use case devolve uma união de resultados que a borda traduz | Exceção → rollback → nada auditado |
+| Outbox com lock durante a chamada ao SQS, §19.1 | Recuperação de queda sem lease nem expiração para calibrar | Uma transação aberta pelo tempo da chamada (limitada a 10s) | Coluna `locked_until` (lease) |
+| Eventos at-least-once em fila standard, §19.2 | Throughput, e sem acoplar a ordem entre agregados | O consumidor deduplica por `eventId` e ordena por `walletVersion` | FIFO por `aggregateId` |
+| PENDING_REFERENCE por tentativas (10, ~5 min), §19.3 | Um worker fora do ar não rejeita tudo de uma vez | Uma reversão sem referência espera até ~5 min pela resposta definitiva | TTL fixo |
+| Uma reversão por referência, de qualquer tipo, §14.1 | Impede REFUND + ROLLBACK da mesma BET (crédito duplo) | Mais restritivo que a letra da regra 4 do desafio | Uma por tipo |
+| Consumer manda para a DLQ na hora conflitos e wallet inexistente, §18.4 | A informação não se perde (pela fila não há resposta para o provedor ler) | Precisa de operação para reprocessar | Ack com log |
+
+### Não implementado (opcional ou fora de escopo)
+
+- **Autenticação** (§11): só o ponto de extensão.
+- **Teste de carga** (`bun run test:load`): não existe. A suíte de concorrência prova correção, não
+  throughput: não há números de p50/p95/p99 nem de outbox lag sob carga.
+- **Ledger de partidas dobradas**: partida simples, um lançamento por transação.
+- **Réplicas no docker compose**: o compose sobe uma instância (§1). A prova com várias instâncias está
+  nos testes com processos reais.
+- **OpenTelemetry e dashboard.**
+- **Reversão parcial** (fora de escopo pelo desafio).
+- **Status `FAILED`:** existe no modelo, no schema e no mapeamento HTTP, mas nada o produz (ver
+  Consumer SQS abaixo).
+
+### Limitações conhecidas
 
 - O `down` da migration de schema apaga o ledger. Existe porque o desafio exige migrations reversíveis;
   não é operação de produção.
@@ -425,6 +524,13 @@ wallet e reconciliação exigiriam um papel de backoffice.
   - `/metrics` e `/health/*` não têm autenticação; em produção ficariam numa porta ou rede interna.
   - Cada scrape de uma réplica `outbox` faz uma consulta à outbox, e de uma `consumer` uma chamada
     `GetQueueAttributes` ao SQS.
+- **Testes:**
+  - `bun test` completo leva cerca de 2 min numa máquina de desenvolvimento: sobe processos reais e
+    espera backoffs reais do SQS (o redrive para a DLQ precisa de 5 recebimentos).
+  - O banco `wagering_test` só cresce, porque o ledger é append-only e os testes usam ids novos em vez
+    de limpar tabelas. Recomeçar do zero é apagar o banco (comando no README).
+  - Os testes de concorrência abrem até 3 × 20 conexões. Um Postgres com `max_connections` menor que o
+    padrão (100) não comporta essa carga.
 
 ## 13. Decisões da fase 1 (scaffolding)
 
@@ -858,3 +964,27 @@ Interpretações do enunciado e escolhas de modelagem, todas cobertas por testes
      reversões resolvidas e 10 sem referência rejeitadas com exatamente 3 tentativas (limite reduzido
      no teste), com os eventos exatos.
    - Unitários: `PublishOutbox` (falha parcial, entrada sem confirmação, broker fora) e `PollingWorker`.
+
+## 20. Decisões da fase 9 (documentação final e auditoria)
+
+1. **Nenhuma mudança de comportamento.** A fase só mexeu em documentação: `README.md`,
+   `ARCHITECTURE.md` e o novo `docs/AUDIT.md`.
+2. **Auditoria num arquivo próprio** (`docs/AUDIT.md`): cada falha eliminatória, cada restrição
+   inviolável, cada teste obrigatório da seção 13 e cada área da tabela de avaliação, com o arquivo e o
+   teste que provam o item. Os itens opcionais não feitos estão listados lá e na §12.
+3. **ARCHITECTURE em duas partes:** §1–12 como estado atual (com trade-offs e limitações reunidos na
+   §12) e §13–20 como registro por fase. As promessas para fases futuras foram trocadas pelo que foi
+   feito ou pela decisão de não fazer (perfil de réplicas no compose, §1).
+4. **Autenticação** (§11): continua não implementada. O desenho foi detalhado: claims, tabela de
+   autorização por rota, onde o código mudaria e por que a regra fica na borda.
+5. **README como roteiro de clone limpo**, verificado em 2026-11-07 (Windows 11, Docker Desktop):
+   - `bun install` e as três suítes rodaram num clone novo do repositório: unitária 321, integração
+     206 + 1 pulado, concorrência 18, 0 falhas;
+   - o stack subiu do zero com `docker compose up -d --build`, sob outro nome de projeto (imagem,
+     containers, volume e filas novos), e os exemplos do README funcionaram: readiness, wallet, BET,
+     replay, 409, reconciliação, mensagem na fila e leitura dos eventos;
+   - o teste de SIGTERM passou no container Linux, com o comando do README;
+   - **contorno de ambiente:** nesta máquina, o Docker Desktop travava ao montar o `init-queues.sh` a
+     partir de uma pasta recém-criada (o container ficava em "Created"). Por isso, o stack de
+     verificação foi construído a partir da pasta original, com código idêntico ao do commit. É um
+     comportamento da instalação do Docker Desktop (compartilhamento de arquivos), não do projeto.
